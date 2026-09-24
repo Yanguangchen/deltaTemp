@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data Helper · Excel workspace</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="vendor/xlsx.full.min.js"></script>
+  <script defer src="data.js"></script>
+  <script defer src="calculator.js"></script>
+  <script defer src="app.js"></script>
+  <script defer src="calculator-ui.js"></script>
+</head>
+<body>
+  <svg class="icon-defs" aria-hidden="true"><defs><symbol id="d-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol><symbol id="d-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol><symbol id="d-copy" viewBox="0 0 24 24"><path d="M8 8h12v13H8zM16 8V3H3v13h5"/></symbol><symbol id="d-example" viewBox="0 0 24 24"><path d="M8 3h8l4 4v14H4V3h4M14 3v6h6M8 13h8m-8 4h5"/></symbol><symbol id="d-clear" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6"/></symbol><symbol id="d-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol><symbol id="d-left" viewBox="0 0 24 24"><path d="m14 5-7 7 7 7"/></symbol><symbol id="d-right" viewBox="0 0 24 24"><path d="m10 5 7 7-7 7"/></symbol><symbol id="d-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol><symbol id="d-refresh" viewBox="0 0 24 24"><path d="M20 8a8 8 0 1 0 0 8M20 3v5h-5"/></symbol><symbol id="d-grid" viewBox="0 0 24 24"><path d="M3 3h18v18H3zM3 9h18M9 3v18M3 15h18"/></symbol><symbol id="d-scan" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M6 14c2-9 10-9 12 0M9 14c1-4 5-4 6 0"/></symbol></defs></svg>
+
+  <header class="topbar">
+    <a class="brand" href="./index.html"><span class="brand-mark">Δ</span> Data Helper</a>
+    <h1 class="page-title">Temperature differences</h1>
+    <nav class="app-nav">
+      <a class="app-nav-link current" href="./index.html" aria-current="page"><svg aria-hidden="true"><use href="#d-grid"/></svg>Temperatures</a>
+      <a class="app-nav-link" href="./gpr-annotator/index.html"><svg aria-hidden="true"><use href="#d-scan"/></svg>GPR Annotator</a>
+    </nav>
+    <span class="local"><span></span> Local workspace</span>
+  </header>
+
+  <main class="workbench">
+    <!-- Left column: everything the user puts in or configures -->
+    <section class="panel input-panel" aria-labelledby="paste-title">
+      <div class="panel-head">
+        <h2 id="paste-title"><span class="step">1</span> Readings</h2>
+        <div class="input-actions">
+          <button id="sample" class="quiet icon-btn" title="Try example data" aria-label="Try example data"><svg aria-hidden="true"><use href="#d-example"/></svg></button>
+          <button id="paste-clear" class="quiet icon-btn" title="Clear pasted readings" aria-label="Clear pasted readings"><svg aria-hidden="true"><use href="#d-clear"/></svg></button>
+        </div>
+      </div>
+      <label class="sr-only" for="paste-input">Paste the temperature table, with or without headers</label>
+      <textarea id="paste-input" spellcheck="false" placeholder="Click here and press Ctrl+V&#10;&#10;Headers are optional.&#10;Include Date &amp; Time and Hours&#10;if you have them."></textarea>
+      <section id="dropzone" class="dropzone" aria-label="Drop an Excel workbook here">
+        <div><span id="drop-title">Or drop an Excel file here</span><span id="drop-detail">.xlsx / .xls · Columns A–U</span></div>
+        <button id="browse" class="secondary icon-btn" title="Choose Excel file" aria-label="Choose Excel file"><svg aria-hidden="true"><use href="#d-upload"/></svg></button>
+        <input id="file" type="file" accept=".xlsx,.xls" hidden>
+      </section>
+      <p id="status" role="status" aria-live="polite"></p>
+      <p id="calc-status" role="status" aria-live="polite"></p>
+
+      <div class="setup">
+        <details id="inferred-layout" class="disclosure" hidden>
+          <summary><span id="inferred-summary">Detected columns</span><span class="summary-action">Adjust</span></summary>
+          <div class="disclosure-body">
+            <p id="inferred-note"></p>
+            <div class="pair-settings">
+              <label>Pasted columns<select id="paste-layout"><option value="auto">Detect automatically</option><option value="temperatures">Temperatures only</option><option value="date">Date &amp; Time + temperatures</option><option value="hours">Hours + temperatures</option><option value="date-hours">Date &amp; Time + Hours + temperatures</option></select></label>
+              <label class="ambient-toggle"><input id="paste-ambient" type="checkbox">Last temperature column is ambient</label>
+            </div>
+          </div>
+        </details>
+
+        <details id="pair-options" class="disclosure">
+          <summary><span>Sensor pairs <span id="pair-summary" class="summary-value"></span></span><span class="summary-action">Edit</span></summary>
+          <div class="disclosure-body">
+            <div class="pair-settings">
+              <label>Pair arrangement<select id="pair-preset"><option value="example">Original sheet · groups of three</option><option value="adjacent">Adjacent sensors · 1 &amp; 2, 3 &amp; 4…</option><option value="custom">Custom pairs</option></select></label>
+              <label>Calculate<select id="difference-mode"><option value="signed">Signed difference (A − B)</option><option value="absolute">Absolute difference |A − B|</option></select></label>
+            </div>
+            <div id="pairs" class="pairs" aria-label="Temperature subtraction pairs"></div>
+            <button id="add-pair" class="secondary icon-btn" title="Add sensor pair" aria-label="Add sensor pair"><svg aria-hidden="true"><use href="#d-plus"/></svg></button>
+          </div>
+        </details>
+
+        <div id="reading-timing" class="timing-panel" hidden>
+          <h3>Add missing date or hours</h3>
+          <p id="timing-note"></p>
+          <div class="pair-settings">
+            <label id="start-time-field">First reading date &amp; time<input id="reading-start" type="datetime-local" step="60"></label>
+            <label id="interval-field">Interval (minutes)<input id="reading-interval" type="number" min="1" step="1" value="30"></label>
+            <label id="first-hour-field">Starting Hours value<input id="reading-first-hour" type="number" min="0" step="1" value="1"></label>
+          </div>
+          <p id="timing-error" role="status"></p>
+        </div>
+
+        <details class="paste-help">
+          <summary>Pasting tips</summary>
+          <p>Keep temperatures in order, starting with Temp-1 when you omit headers. Include dates and hours to carry them into the results.</p>
+          <p>Excel may copy rounded display values. Show more decimal places before copying, or import the workbook for full stored precision. Columns V onward are excluded.</p>
+        </details>
+      </div>
+    </section>
+
+    <!-- Right column: results only -->
+    <div class="result-column">
+      <div id="results-empty" class="panel results-empty">
+        <div>
+          <span class="step">2</span>
+          <h2>Results appear here</h2>
+          <p>Paste readings or drop a workbook on the left. Dates, hours and sensor differences are calculated as you type.</p>
+        </div>
+      </div>
+
+      <section id="calculation" class="panel" hidden>
+        <div class="panel-head">
+          <h2><span class="step">2</span> Results</h2>
+          <span id="calc-count" class="count"></span>
+          <div class="result-actions">
+            <button id="download-results" class="secondary icon-btn" title="Download results as Excel" aria-label="Download results as Excel"><svg aria-hidden="true"><use href="#d-download"/></svg></button>
+            <button id="copy-results" class="primary copy-btn" title="Copy results for Excel" aria-label="Copy results for Excel"><svg aria-hidden="true"><use href="#d-copy"/></svg> Copy for Excel</button>
+          </div>
+        </div>
+        <p class="panel-sub">Differential temperature in vertical plane · °C · updates automatically</p>
+        <div class="table-panel result-panel">
+          <div class="table-scroll" tabindex="0" role="region" aria-label="Calculated temperature differences"><table id="result-table"><thead></thead><tbody></tbody></table></div>
+          <div class="pagination">
+            <p id="result-info"></p>
+            <div><button id="result-prev" class="secondary icon-btn" title="Previous results page" aria-label="Previous results page"><svg aria-hidden="true"><use href="#d-left"/></svg></button><span id="result-page"></span><button id="result-next" class="secondary icon-btn" title="Next results page" aria-label="Next results page"><svg aria-hidden="true"><use href="#d-right"/></svg></button></div>
+          </div>
+        </div>
+        <p id="result-note" class="footnote"></p>
+        <p id="result-status" role="status" aria-live="polite"></p>
+        <div id="copy-fallback" hidden><label for="copy-text">Select and copy this table with Ctrl+C, then paste into Excel.</label><textarea id="copy-text" readonly></textarea></div>
+      </section>
+
+      <section id="empty" hidden></section>
+
+      <section id="workspace" class="panel" hidden>
+        <div class="workspace-heading">
+          <div><p class="eyebrow">SOURCE WORKBOOK</p><h2 id="filename"></h2></div>
+          <label class="sheet-label">Worksheet<select id="sheet"></select></label>
+          <button id="clear" class="quiet icon-btn" title="Remove workbook" aria-label="Remove workbook"><svg aria-hidden="true"><use href="#d-clear"/></svg></button>
+        </div>
+        <details id="workbook-options" class="disclosure">
+          <summary><span>View source data &amp; import settings</span></summary>
+          <div class="disclosure-body">
+            <div class="settings">
+              <label>First header row<input id="header-row" type="number" min="1" value="1"></label>
+              <label>Header rows<select id="header-depth"><option value="1">1 row</option><option value="2">2 rows</option><option value="3">3 rows</option></select></label>
+              <button id="apply" class="secondary icon-btn" title="Apply import layout" aria-label="Apply import layout"><svg aria-hidden="true"><use href="#d-check"/></svg></button>
+              <p>Columns <strong>A–U</strong></p>
+            </div>
+            <div class="table-panel">
+              <div class="table-toolbar">
+                <div><h2>Data preview <span id="row-count" class="count"></span></h2><p id="layout-note"></p></div>
+                <button id="export" class="primary icon-btn" title="Export source rows" aria-label="Export source rows"><svg aria-hidden="true"><use href="#d-download"/></svg></button>
+              </div>
+              <div class="filters">
+                <label class="search"><span class="sr-only">Search all columns</span><input id="search" type="search" placeholder="Search all columns…"></label>
+                <label><span class="sr-only">Filter column</span><select id="filter-column"><option value="">Filter a column</option></select></label>
+                <label class="filter-value"><span class="sr-only">Column contains</span><input id="filter-value" placeholder="Contains…" disabled></label>
+                <button id="reset" class="quiet icon-btn" title="Reset filters" aria-label="Reset filters"><svg aria-hidden="true"><use href="#d-refresh"/></svg></button>
+              </div>
+              <div class="table-scroll source-scroll" tabindex="0" role="region" aria-label="Imported rows, scroll horizontally to see all columns"><table id="table"><thead></thead><tbody></tbody></table><div id="no-rows" hidden>No rows match your filters.</div></div>
+              <div class="pagination">
+                <p id="page-info"></p>
+                <div><label>Rows per page <select id="page-size"><option>25</option><option selected>50</option><option>100</option></select></label><button id="prev" class="secondary icon-btn" title="Previous page" aria-label="Previous page"><svg aria-hidden="true"><use href="#d-left"/></svg></button><span id="page-number"></span><button id="next" class="secondary icon-btn" title="Next page" aria-label="Next page"><svg aria-hidden="true"><use href="#d-right"/></svg></button></div>
+              </div>
+            </div>
+            <p class="footnote">Click a heading to sort. Source exports include all matching rows in A–U. Formulas use the results last saved in Excel.</p>
+          </div>
+        </details>
+      </section>
+    </div>
+  </main>
+
+  <footer><span>Data stays on your device.</span><span>Works offline · No account needed</span></footer>
+</body>
+</html>

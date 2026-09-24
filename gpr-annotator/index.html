@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPR Annotator — AI-assisted radargram markup</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg class="icon-defs" aria-hidden="true"><defs>
+<symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5 8 12l7 7M8 12h13"/></symbol>
+<symbol id="i-scan" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M6 14c2-9 10-9 12 0M9 14c1-4 5-4 6 0"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
+<symbol id="i-pulse" viewBox="0 0 24 24"><path d="M2 12h5l3-8 4 16 3-8h5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6"/></symbol>
+<symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 8a8 8 0 1 0 0 8M20 3v5h-5"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 19 19 5M8 5h11v11"/></symbol>
+<symbol id="i-resize" viewBox="0 0 24 24"><path d="m8 16 8-8M10 8h6v6M8 10v6h6"/></symbol>
+</defs></svg>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"><svg><use href="#i-scan"/></svg></span>
+    <div>
+      <h1>GPR Annotator</h1>
+      <p>Read the reflections.</p>
+    </div>
+  </div>
+
+  <div class="topbar-actions">
+    <a class="btn ghost icon-btn" href="../index.html" title="Back to Data Helper" aria-label="Back to Data Helper"><svg><use href="#i-back"/></svg></a>
+    <a class="btn ghost icon-btn" href="./observability.html" title="Activity & logs" aria-label="Activity & logs"><svg><use href="#i-pulse"/></svg></a>
+    <button id="btn-settings" class="btn ghost icon-btn" type="button" title="Settings" aria-label="Settings"><svg><use href="#i-settings"/></svg></button>
+    <span class="toolbar-divider"></span>
+    <button id="btn-export" class="btn ghost icon-btn" type="button" title="Export annotated PNG" aria-label="Export annotated PNG" disabled><svg><use href="#i-download"/></svg></button>
+    <button id="btn-analyze" class="btn primary icon-btn" type="button" title="Analyze scan" aria-label="Analyze scan" disabled><svg><use href="#i-scan"/></svg><span class="sr-only">Analyze scan</span></button>
+  </div>
+</header>
+
+<div id="origin-warning" class="origin-warning" hidden></div>
+
+<main class="layout">
+
+  <!-- ── Canvas ─────────────────────────────────────────── -->
+  <section class="stage-wrap">
+    <div class="canvas-toolbar"><span><span class="status-dot"></span> Radargram</span><span id="image-name">No scan loaded</span><button id="btn-arrow" class="btn icon-btn" type="button" title="Draw an arrow" aria-label="Draw an arrow" aria-pressed="false" disabled><svg><use href="#i-arrow"/></svg></button><label for="file-input" class="btn icon-btn" tabindex="0" title="Open or replace scan" aria-label="Open or replace scan"><svg><use href="#i-upload"/></svg></label></div>
+    <div id="dropzone" class="dropzone">
+      <div class="dz-inner">
+        <svg viewBox="0 0 24 24" class="dz-icon" aria-hidden="true">
+          <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 17v1.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V17"/>
+        </svg>
+        <p class="eyebrow">START WITH A SCAN</p><h2>Drop your radargram here</h2>
+        <p>or <label for="file-input" class="linklike">browse files</label></p><p class="file-types">PNG, JPG or WebP · Keep the axes visible</p>
+        <input id="file-input" type="file" accept="image/*" hidden>
+      </div>
+    </div>
+
+    <div id="stage" class="stage" hidden>
+      <div id="frame" class="frame">
+        <img id="gpr-image" alt="Ground penetrating radar image">
+        <svg id="arrow-layer" class="arrow-layer"></svg>
+        <div id="label-layer" class="label-layer"></div>
+      </div>
+      <div id="stage-status" class="stage-status" hidden>
+        <span class="spinner"></span>
+        <span id="stage-status-text">Analyzing…</span>
+        <button id="btn-cancel" class="btn icon-btn" type="button" title="Cancel analysis" aria-label="Cancel analysis"><svg><use href="#i-close"/></svg></button>
+      </div>
+    </div>
+    <div class="canvas-caption"><span id="canvas-hint" role="status">Drag to move · Top-right handle to resize</span><span>Double-click a label to rename</span></div>
+  </section>
+
+  <!-- ── Side panel ─────────────────────────────────────── -->
+  <aside class="panel">
+    <div class="panel-head">
+      <h2>Annotations <span id="ann-count">0</span></h2>
+      <div class="panel-head-actions">
+        <button id="btn-add" class="btn tiny icon-btn" type="button" title="Add a target manually" aria-label="Add a target manually" disabled><svg><use href="#i-plus"/></svg></button>
+        <button id="btn-clear" class="btn tiny icon-btn danger" type="button" title="Clear all annotations" aria-label="Clear all annotations" disabled><svg><use href="#i-trash"/></svg></button>
+      </div>
+    </div>
+
+    <div id="ann-list" class="ann-list">
+      <p class="empty">Your targets will appear here.<br>Upload a scan and select the scan icon to start.</p>
+    </div>
+
+    <div class="panel-foot">
+      <details class="context-card" open><summary>Scan context <span>Optional</span></summary><label class="field">
+        <span>Interpretation focus <em>(optional)</em></span>
+        <textarea id="prompt-hint" rows="3" placeholder="e.g. focus on buried utilities and rebar spacing; survey line is 12 m long, 0–1.5 m depth"></textarea>
+      </label>
+      <label class="field velocity-field"><span>Wave velocity <em>(m/ns)</em></span><input id="wave-velocity" type="number" min="0.001" max="0.3" step="0.001" placeholder="Use value from survey calibration"><small>Only needed to convert a time axis into depth.</small></label></details>
+      <p class="hint">Distances are approximate readings from the image axes. Along-scan position is measured on the scan line.</p>
+    </div>
+  </aside>
+</main>
+
+<!-- ── Settings dialog ──────────────────────────────────── -->
+<dialog id="settings" class="settings">
+  <form method="dialog" class="settings-inner">
+    <h2>Gemini settings</h2>
+
+    <p id="server-status" class="server-status" hidden></p>
+
+    <label class="field">
+      <span>API key <em>(browser fallback)</em></span>
+      <input id="api-key" type="password" placeholder="AIza…" autocomplete="off">
+    </label>
+
+    <label class="field">
+      <span>Model</span>
+      <input id="model-name" list="model-list" placeholder="gemini-3.7-flash">
+      <datalist id="model-list">
+        <option value="gemini-3.7-flash"></option>
+        <option value="gemini-3.8-flash"></option>
+        <option value="gemini-3.6-flash"></option>
+        <option value="gemini-3.5-flash"></option>
+        <option value="gemini-3.1-pro-preview"></option>
+      </datalist>
+    </label>
+
+    <div class="model-check">
+      <button id="btn-list-models" class="btn icon-btn" type="button" title="Refresh available models" aria-label="Refresh available models"><svg><use href="#i-refresh"/></svg></button>
+      <p id="model-note" class="model-note" hidden></p>
+    </div>
+
+    <p class="warn">
+      Used only when the page is opened without <code>server.js</code>. This key is stored in
+      <code>localStorage</code> and sent straight from the browser to Google. Run
+      <code>npm start</code> instead to keep the key server-side in <code>.env</code>.
+    </p>
+
+    <menu>
+      <button value="cancel" class="btn ghost icon-btn" type="submit" title="Close settings" aria-label="Close settings"><svg><use href="#i-close"/></svg></button>
+      <button id="btn-save-settings" value="save" class="btn primary icon-btn" type="submit" title="Save settings" aria-label="Save settings"><svg><use href="#i-check"/></svg></button>
+    </menu>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="telemetry.js"></script>
+<script src="prompt.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

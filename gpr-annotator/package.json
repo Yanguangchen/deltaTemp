@@ -1,0 +1,13 @@
+{
+  "name": "gpr-annotator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-assisted ground penetrating radar annotation — upload a radargram, Gemini marks the features, you drag the arrows and labels into place.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

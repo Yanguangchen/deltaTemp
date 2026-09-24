@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPR Annotator — Observability</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .obs-main { padding: 20px 22px 60px; overflow-y: auto; height: calc(100vh - 56px); }
+  .obs-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .tile { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 13px 15px; }
+  .tile .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--text-mute); }
+  .tile .v { font-size: 23px; font-weight: 600; margin-top: 5px; font-variant-numeric: tabular-nums; }
+  .tile .sub { font-size: 11px; color: var(--text-dim); margin-top: 3px; font-family: var(--mono); }
+  .v.ok { color: #06d6a0; } .v.bad { color: var(--danger); } .v.warn { color: #ffd166; }
+
+  h2.sec { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim);
+           margin: 24px 0 10px; display: flex; align-items: center; gap: 10px; }
+  h2.sec::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+
+  table.obs { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--mono); }
+  table.obs th { text-align: left; font-weight: 600; color: var(--text-dim); padding: 7px 9px;
+                 border-bottom: 1px solid var(--line-2); position: sticky; top: 0; background: var(--bg); }
+  table.obs td { padding: 6px 9px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.obs tr:hover td { background: var(--bg-2); }
+  .wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 9px; background: var(--bg-2); }
+
+  .lvl { font-weight: 600; }
+  .lvl-error { color: var(--danger); } .lvl-warn { color: #ffd166; }
+  .lvl-info { color: #06d6a0; } .lvl-debug, .lvl-trace { color: var(--text-mute); }
+  .ev { color: #4da3ff; }
+  .fields { color: var(--text-dim); word-break: break-word; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty-row { color: var(--text-mute); padding: 18px; font-family: var(--sans); font-size: 12.5px; }
+  .controls { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+  select, .controls label { font-size: 12px; color: var(--text-dim); }
+  .flash { animation: flash .6s ease-out; }
+  @keyframes flash { from { background: #1b3a52; } to { background: transparent; } }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <div>
+      <h1>Observability</h1>
+      <p>GPR Annotator · live server + client telemetry</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <a class="btn ghost back-link" href="./index.html">← Annotator</a>
+    <label class="controls"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <button id="refresh" class="btn primary" type="button">Refresh</button>
+  </div>
+</header>
+
+<main class="obs-main">
+  <div id="banner" class="server-status" hidden></div>
+
+  <div class="obs-grid" id="tiles"></div>
+
+  <h2 class="sec">In flight</h2>
+  <div class="wrap"><table class="obs" id="inflight"></table></div>
+
+  <h2 class="sec">Recent analyses</h2>
+  <div class="wrap"><table class="obs" id="analyses"></table></div>
+
+  <h2 class="sec">Latency (ms)</h2>
+  <div class="wrap"><table class="obs" id="latency"></table></div>
+
+  <h2 class="sec">Counters</h2>
+  <div class="wrap"><table class="obs" id="counters"></table></div>
+
+  <h2 class="sec">Log
+    <span class="controls">
+      <label>min level
+        <select id="level">
+          <option value="trace">trace</option>
+          <option value="debug">debug</option>
+          <option value="info" selected>info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+      </label>
+    </span>
+  </h2>
+  <div class="wrap" style="max-height:440px;overflow-y:auto"><table class="obs" id="logs"></table></div>
+</main>
+
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const ms = (v) => (v == null ? '—' : v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`);
+
+  let lastLogTs = null;
+
+  function tile(k, v, sub, cls = '') {
+    return `<div class="tile"><div class="k">${esc(k)}</div>
+      <div class="v ${cls}">${esc(v)}</div>
+      ${sub ? `<div class="sub">${esc(sub)}</div>` : ''}</div>`;
+  }
+
+  function table(el, headers, rows, emptyMsg) {
+    if (!rows.length) {
+      el.innerHTML = `<tr><td class="empty-row">${esc(emptyMsg)}</td></tr>`;
+      return;
+    }
+    el.innerHTML =
+      `<thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>` +
+      `<tbody>${rows.join('')}</tbody>`;
+  }
+
+  async function load() {
+    let health, metrics, logs;
+    try {
+      [health, metrics, logs] = await Promise.all([
+        fetch('/api/health').then((r) => r.json()),
+        fetch('/api/metrics').then((r) => r.json()),
+        fetch(`/api/logs?limit=300&level=${$('level').value}`).then((r) => r.json()),
+      ]);
+      $('banner').hidden = true;
+    } catch (err) {
+      $('banner').hidden = false;
+      $('banner').textContent = `Cannot reach the server: ${err.message}. Is server.js running? This page needs http://localhost:8787/gpr-annotator/observability.html — it does not work over file://.`;
+      return;
+    }
+
+    const c = metrics.counters;
+    const sum = (prefix) => Object.entries(c)
+      .filter(([k]) => k.startsWith(prefix))
+      .reduce((a, [, v]) => a + v, 0);
+
+    const ok = sum('analyze.success');
+    const fail = sum('analyze.failure');
+    const retries = sum('gemini.retries');
+    const fallbacks = sum('gemini.fallbacks');
+    const dur = metrics.latencyMs[Object.keys(metrics.latencyMs).find((k) => k.startsWith('analyze.duration')) || ''];
+
+    $('tiles').innerHTML = [
+      tile('status', health.status, health.reason || `${health.model}`, health.status === 'ok' ? 'ok' : 'bad'),
+      tile('uptime', `${Math.floor(health.uptimeSeconds / 60)}m`, `since ${health.startedAt.slice(11, 19)}`),
+      tile('analyses ok', ok, `${fail} failed`, ok ? 'ok' : ''),
+      tile('in flight', health.inFlight.length, health.inFlight.length ? 'request active' : 'idle',
+        health.inFlight.some((r) => r.elapsedMs > 20000) ? 'bad' : ''),
+      tile('p95 analyze', dur ? ms(dur.p95) : '—', dur ? `p50 ${ms(dur.p50)} · max ${ms(dur.max)}` : 'no samples'),
+      tile('retries', retries, `${fallbacks} fallbacks`, retries ? 'warn' : ''),
+      tile('tokens', sum('gemini.tokens_total').toLocaleString(), 'total billed'),
+      tile('memory', `${health.process.rssMb} MB`, `node ${health.process.node} · pid ${health.process.pid}`),
+    ].join('');
+
+    table($('inflight'), ['reqId', 'method', 'path', 'elapsed'],
+      health.inFlight.map((r) => `<tr><td>${esc(r.reqId)}</td><td>${esc(r.method)}</td><td>${esc(r.path)}</td>
+        <td class="num ${r.elapsedMs > 20000 ? 'lvl-error' : ''}">${ms(r.elapsedMs)}</td></tr>`),
+      'Nothing in flight. A stuck "Analyzing…" with nothing here means the browser never reached the server.');
+
+    table($('analyses'), ['at', 'requested', 'used', 'result', 'dur', 'img', 'marks', 'tries', 'tokens'],
+      metrics.recentAnalyses.map((a) => `<tr>
+        <td>${esc(a.at.slice(11, 19))}</td><td>${esc(a.requested)}</td>
+        <td class="${a.usedFallback ? 'lvl-warn' : ''}">${esc(a.modelUsed)}</td>
+        <td class="${a.ok ? 'lvl-info' : 'lvl-error'}">${a.ok ? 'ok' : esc(`${a.status || 'err'}`)}</td>
+        <td class="num">${ms(a.ms)}</td><td class="num">${esc(a.imageMb)} MB</td>
+        <td class="num">${a.annotations ?? '—'}</td><td class="num">${a.attempts ?? '—'}</td>
+        <td class="num">${a.tokens ?? '—'}</td></tr>`),
+      'No analyses recorded yet.');
+
+    table($('latency'), ['metric', 'n', 'min', 'p50', 'p95', 'p99', 'max', 'mean'],
+      Object.entries(metrics.latencyMs).map(([k, v]) => `<tr><td>${esc(k)}</td>
+        <td class="num">${v.count}</td><td class="num">${v.min}</td><td class="num">${v.p50}</td>
+        <td class="num">${v.p95}</td><td class="num">${v.p99}</td><td class="num">${v.max}</td>
+        <td class="num">${v.mean}</td></tr>`),
+      'No latency samples yet.');
+
+    table($('counters'), ['counter', 'value'],
+      Object.entries(c).map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v}</td></tr>`),
+      'No counters yet.');
+
+    const entries = logs.entries.slice().reverse();
+    table($('logs'), ['time', 'level', 'event', 'fields'],
+      entries.map((e) => {
+        const { ts, level, event, ...rest } = e;
+        const fresh = lastLogTs && ts > lastLogTs ? ' class="flash"' : '';
+        return `<tr${fresh}><td>${esc(ts.slice(11, 23))}</td>
+          <td class="lvl lvl-${esc(level)}">${esc(level)}</td>
+          <td class="ev">${esc(event)}</td>
+          <td class="fields">${esc(Object.entries(rest).map(([k, v]) =>
+            `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join('  '))}</td></tr>`;
+      }),
+      'No log entries at this level.');
+
+    if (entries.length) lastLogTs = entries[0].ts;
+  }
+
+  $('refresh').addEventListener('click', load);
+  $('level').addEventListener('change', load);
+
+  let timer = null;
+  const tick = () => { if ($('auto').checked) load(); };
+  $('auto').addEventListener('change', () => {
+    clearInterval(timer);
+    if ($('auto').checked) timer = setInterval(tick, 2000);
+  });
+  timer = setInterval(tick, 2000);
+
+  load();
+})();
+</script>
+</body>
+</html>

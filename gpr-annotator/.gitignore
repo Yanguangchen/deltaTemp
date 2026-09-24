@@ -1,0 +1,6 @@
+.env
+node_modules/
+*.log
+logs/
+*.jsonl
+gpr-annotated-*.png

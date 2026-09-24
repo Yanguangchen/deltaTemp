@@ -1,0 +1,10 @@
+# Secrets — never commit. Keep .env.example (the template) tracked.
+.env
+.env.*
+!.env.example
+
+node_modules/
+*.log
+logs/
+*.jsonl
+__preview*
