@@ -106,6 +106,8 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
 };
 
 function json(res, status, payload) {

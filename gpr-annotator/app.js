@@ -1,6 +1,11 @@
 /* GPR Annotator — AI-assisted radargram markup.
-   Annotations are stored in normalized image space (0..1) so they survive
-   window resizing and export at full source resolution. */
+
+   Coordinates are normalized against the IMAGE (0..1 spans the radargram), but
+   they are deliberately NOT clamped to that range: the drawing canvas is a
+   separate, larger surface and the image is centred inside it. A label at
+   x = -0.2 sits in the left margin, outside the scan. Because the unit is still
+   "fraction of the image", every annotation stays locked to the same pixels
+   through window resizes, zooming, and export at source resolution. */
 
 (() => {
   'use strict';
@@ -11,9 +16,11 @@
     dropzone:   $('dropzone'),
     fileInput:  $('file-input'),
     stage:      $('stage'),
+    canvasWrap: $('canvas-wrap'),
+    canvas:     $('canvas'),
     frame:      $('frame'),
     image:      $('gpr-image'),
-    arrows:     $('arrow-layer'),
+    shapes:     $('arrow-layer'),
     labels:     $('label-layer'),
     status:     $('stage-status'),
     statusText: $('stage-status-text'),
@@ -28,6 +35,7 @@
     btnExport:   $('btn-export'),
     btnAdd:      $('btn-add'),
     btnClear:    $('btn-clear'),
+    btnArrange:  $('btn-arrange'),
     serverStatus: $('server-status'),
     modelList:    $('model-list'),
     modelNote:    $('model-note'),
@@ -37,8 +45,28 @@
     velocity: $('wave-velocity'),
     imageName: $('image-name'),
     annCount: $('ann-count'),
-    btnArrow: $('btn-arrow'),
     canvasHint: $('canvas-hint'),
+    tools: [...document.querySelectorAll('.tool')],
+    zoomIn: $('zoom-in'),
+    zoomOut: $('zoom-out'),
+    zoomFit: $('zoom-fit'),
+    zoomLevel: $('zoom-level'),
+    btnUndo: $('btn-undo'),
+    btnRedo: $('btn-redo'),
+    editor: $('ann-editor'),
+    editKind: $('edit-kind'),
+    editLabel: $('edit-label'),
+    editNote: $('edit-note'),
+    editConf: $('edit-conf'),
+    editConfOut: $('edit-conf-out'),
+    confField: $('conf-field'),
+    btnConfClear: $('btn-conf-clear'),
+    editColors: $('edit-colors'),
+    editWeight: $('edit-weight'),
+    editWeightOut: $('edit-weight-out'),
+    btnWeightReset: $('btn-weight-reset'),
+    btnDuplicate: $('btn-duplicate'),
+    btnDeleteSel: $('btn-delete-sel'),
   };
 
   /* Gemini is sent a downscaled copy — a phone photo is tens of megabytes as
@@ -56,29 +84,59 @@
   const DEFAULT_MODEL = PROMPT.DEFAULT_MODEL;
   const STORE_KEY = 'gpr-annotator/settings';
 
+  /* What each annotation kind owns geometrically.
+       point : a single target point (tx,ty) with a ringed handle
+       two   : two draggable endpoints, a and b
+       path  : a freehand polyline
+       label : shows a text card;  leader: joins that card to the target */
+  const KIND = {
+    target: { name: 'Target',      point: true, label: true, leader: true },
+    arrow:  { name: 'Arrow',       two: true },
+    box:    { name: 'Region',      two: true,   label: true },
+    ruler:  { name: 'Measurement', two: true,   readout: true },
+    free:   { name: 'Trace',       path: true,  label: true, leader: true },
+    note:   { name: 'Note',        label: true },
+  };
+
+  const TOOL_HINT = {
+    '':      'Drag to move · Labels can sit in the margin around the scan',
+    arrow:   'Drag from the arrow tail to its tip · Esc to cancel',
+    box:     'Drag a rectangle around the region · Esc to cancel',
+    ruler:   'Drag between the two points you want measured · Esc to cancel',
+    free:    'Drag to trace the reflector · Esc to cancel',
+    note:    'Click anywhere — including the margin — to drop a note',
+  };
+
   const state = {
     image: null,        // { dataUrl, mimeType, base64, naturalW, naturalH }
     annotations: [],
     selectedId: null,
     busy: false,
     seq: 0,
-    tool: null,
-    server: { hasServerKey: false, model: null }, // filled by probeServer()
-    apiBase: '',                                  // '' = same origin
+    tool: '',
+    zoom: 1,
+    calibration: null,  // axis calibration from the last analysis, reused by manual shapes
+    server: { hasServerKey: false, model: null },
+    apiBase: '',
   };
 
-  /* Is server.js running with a key in .env? If so we proxy through it and the
-     browser never handles the key at all. */
-  /* The page may be served by something other than server.js — VS Code Live
-     Server on :5500 is the common case. Try same-origin first, then the known
-     API port, so the app works from either. */
+  /* Canvas geometry, recomputed on every layout pass.
+     x,y,w,h = where the image sits inside the canvas, in canvas pixels. */
+  let view = { x: 0, y: 0, w: 1, h: 1, cw: 1, ch: 1, scale: 1, fit: 1 };
+
+  const VIEW_FIT = 0.70;   // fitted image fills this share of the canvas, leaving margin
+  const ZOOM_MIN = 0.15;
+  const ZOOM_MAX = 8;
+
+  /* ── Server probe ───────────────────────────────────── */
+
   const API_FALLBACK_ORIGIN = `${location.protocol === 'https:' ? 'https' : 'http'}://localhost:8787`;
 
   async function resolveApiBase() {
     const candidates = ['', API_FALLBACK_ORIGIN];
 
     for (const base of candidates) {
-      if (base && base === location.origin) continue; // already tried as same-origin
+      if (base && base === location.origin) continue;
       try {
         const res = await fetch(`${base}/api/config`, { cache: 'no-store' });
         if (!res.ok) continue;
@@ -92,8 +150,6 @@
 
   async function probeServer() {
     if (location.protocol === 'file:') {
-      // No /api/* can ever work from a file:// page. Say so loudly instead of
-      // silently falling back to a direct call with no timeout.
       T.warn('server.unreachable', { reason: 'file-protocol', href: location.href });
       showOriginWarning(
         'This page was opened directly from disk (<code>file://</code>), so it cannot use the server or the key in <code>.env.local</code>. ' +
@@ -122,7 +178,6 @@
     T.info('server.config', { ...found.cfg, apiBase: found.base || '(same origin)', clientVersion: T.version });
 
     if (found.base) {
-      // Served by another dev server; the API is being reached cross-origin.
       showOriginWarning(
         `This page is served from <code>${location.origin}</code>, so API calls are going cross-origin to ` +
         `<code>${found.base}</code>. That works, but <a href="${found.base}/gpr-annotator/">${found.base}/gpr-annotator/</a> ` +
@@ -219,7 +274,6 @@
           base64: dataUrl.slice(comma + 1),
           naturalW: probe.naturalWidth,
           naturalH: probe.naturalHeight,
-          // what actually gets sent to Gemini
           uploadMime: upload.mimeType,
           uploadBase64: upload.base64,
           uploadNote: upload.note,
@@ -227,7 +281,11 @@
         state.annotations = [];
         state.selectedId = null;
         state.seq = 0;
-        setTool(null);
+        state.calibration = null;
+        state.zoom = 1;
+        history.past.length = 0;
+        history.future.length = 0;
+        setTool('');
 
         el.image.src = dataUrl;
         el.imageName.textContent = file.name;
@@ -279,101 +337,239 @@
   }
 
   function setEnabled(on) {
-    el.btnAnalyze.disabled = !on || state.busy;
-    el.btnExport.disabled = !on;
-    el.btnAdd.disabled = !on;
-    el.btnClear.disabled = !on;
-    el.btnArrow.disabled = !on;
+    const off = !on;
+    el.btnAnalyze.disabled = off || state.busy;
+    for (const b of [el.btnExport, el.btnAdd, el.btnClear, el.btnArrange,
+                     el.zoomIn, el.zoomOut, el.zoomFit, ...el.tools]) b.disabled = off;
+    updateHistoryButtons();
   }
 
   /* ── Annotation model ───────────────────────────────── */
 
-  function addAnnotation({ label, note = '', confidence = null, tx, ty, lx, ly, calibration = null, velocityMPerNs = null, curve = [], kind = 'target' }) {
+  const num = (v, fallback = 0) => (Number.isFinite(Number(v)) ? Number(v) : fallback);
+  const clamp01 = (v) => Math.min(1, Math.max(0, num(v)));
+  const byId = (id) => state.annotations.find((a) => a.id === id);
+
+  /* Line weight is a multiplier on each shape's natural stroke width, so one
+     control thickens arrows, boxes, rulers and traces consistently. New
+     annotations inherit the last weight the operator chose. */
+  const WEIGHT_MIN = 0.4;
+  const WEIGHT_MAX = 4;
+  const clampWeight = (v) => Math.min(WEIGHT_MAX, Math.max(WEIGHT_MIN, num(v, 1)));
+  const weightOf = (ann) => clampWeight(ann.weight);
+  const strokeStyle = (base, ann) => `stroke-width:${(base * weightOf(ann)).toFixed(2)}px`;
+  let lastWeight = 1;
+
+  function addAnnotation(opts) {
+    const {
+      label, note = '', confidence = null, tx = 0.5, ty = 0.5, lx = 0.5, ly = 0.4,
+      calibration = null, velocityMPerNs = null, curve = [], kind = 'target',
+      a = null, b = null, path = null, color = null, weight = lastWeight,
+    } = opts;
+
     const ann = {
       id: `a${++state.seq}`,
-      label: label || 'Untitled feature',
+      kind,
+      label: label || defaultLabel(kind),
       note,
       confidence,
-      calibration, velocityMPerNs, curve,
-      kind, labelScale: 1,
-      color: PALETTE[(state.seq - 1) % PALETTE.length],
-      tx: clamp01(tx),
-      ty: clamp01(ty),
-      lx: clamp01(lx),
-      ly: clamp01(ly),
+      calibration: calibration || state.calibration,
+      velocityMPerNs,
+      curve,
+      path: path ? path.map((p) => ({ x: num(p.x), y: num(p.y) })) : null,
+      a: a ? { x: num(a.x), y: num(a.y) } : null,
+      b: b ? { x: num(b.x), y: num(b.y) } : null,
+      labelScale: 1,
+      weight: clampWeight(weight),
+      color: color || PALETTE[(state.seq - 1) % PALETTE.length],
+      tx: num(tx), ty: num(ty),
+      lx: num(lx), ly: num(ly),
     };
     state.annotations.push(ann);
     return ann;
   }
 
-  const clamp01 = (v) => Math.min(1, Math.max(0, Number(v) || 0));
-  const byId = (id) => state.annotations.find((a) => a.id === id);
-  const metricsFor = ann => PROMPT.measurePoint(ann.calibration, {x:ann.tx*1000,y:ann.ty*1000}, el.velocity.value || ann.velocityMPerNs);
-  const metres = value => value===null ? 'Unknown' : `≈ ${Number(value.toPrecision(3))} m`;
+  const defaultLabel = (kind) => ({
+    target: 'Untitled feature', arrow: 'Arrow', box: 'Region of interest',
+    ruler: 'Measurement', free: 'Traced reflector', note: 'Note',
+  }[kind] || 'Untitled feature');
+
+  /* Every draggable point an annotation owns, as live references. */
+  function points(ann) {
+    const out = [];
+    const k = KIND[ann.kind];
+    if (k.two) { out.push(ann.a, ann.b); }
+    if (k.point) out.push({ get x() { return ann.tx; }, set x(v) { ann.tx = v; }, get y() { return ann.ty; }, set y(v) { ann.ty = v; } });
+    if (k.path && ann.path) out.push(...ann.path);
+    if (k.label) out.push({ get x() { return ann.lx; }, set x(v) { ann.lx = v; }, get y() { return ann.ly; }, set y(v) { ann.ly = v; } });
+    return out.filter(Boolean);
+  }
+
+  function translate(ann, dx, dy) {
+    for (const p of points(ann)) { p.x += dx; p.y += dy; }
+  }
+
+  /* Bounding box of an annotation's geometry, ignoring its label card. */
+  function shapeBox(ann) {
+    const xs = [];
+    const ys = [];
+    const k = KIND[ann.kind];
+    if (k.two && ann.a && ann.b) { xs.push(ann.a.x, ann.b.x); ys.push(ann.a.y, ann.b.y); }
+    if (k.point) { xs.push(ann.tx); ys.push(ann.ty); }
+    if (k.path && ann.path) for (const p of ann.path) { xs.push(p.x); ys.push(p.y); }
+    if (!xs.length) { xs.push(ann.lx); ys.push(ann.ly); }
+    return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+  }
+
+  const pathMid = (path) => path[Math.floor(path.length / 2)] || { x: 0.5, y: 0.5 };
+
+  /* ── Measurements ───────────────────────────────────── */
+
+  const calOf = (ann) => ann.calibration || state.calibration;
+  const measureAt = (ann, x, y) =>
+    PROMPT.measurePoint(calOf(ann), { x: x * 1000, y: y * 1000 }, el.velocity.value || ann.velocityMPerNs);
+  const metricsFor = (ann) => measureAt(ann, ann.tx, ann.ty);
+  const metres = (value) => (value === null ? 'Unknown' : `≈ ${Number(value.toPrecision(3))} m`);
+
   function measurementSummary(ann) {
-    if(!ann.calibration)return '';
-    const m=metricsFor(ann);
+    if (!calOf(ann)) return '';
+    const m = metricsFor(ann);
     return `${metres(m.alongM)} along · ${metres(m.depthM)} deep`;
   }
 
-  /* Pick a label spot near the target that avoids the other labels. */
-  function placeLabel(tx, ty, taken) {
-    const radii = [0.16, 0.24, 0.32];
-    const angles = [-90, -45, -135, 0, 180, 45, 135, 90];
-    let best = null;
-    let bestScore = -Infinity;
-
-    for (const r of radii) {
-      for (const deg of angles) {
-        const rad = (deg * Math.PI) / 180;
-        const x = tx + Math.cos(rad) * r * 0.75;
-        const y = ty + Math.sin(rad) * r;
-        if (x < 0.1 || x > 0.9 || y < 0.06 || y > 0.94) continue;
-
-        let nearest = Infinity;
-        for (const p of taken) {
-          nearest = Math.min(nearest, Math.hypot(p.x - x, p.y - y));
-        }
-        const score = Math.min(nearest, 0.35) - r * 0.25;
-        if (score > bestScore) { bestScore = score; best = { x, y }; }
+  /* Ruler readout: axis-calibrated where possible, image fractions otherwise. */
+  function rulerSummary(ann) {
+    if (!ann.a || !ann.b) return '';
+    if (calOf(ann)) {
+      const m1 = measureAt(ann, ann.a.x, ann.a.y);
+      const m2 = measureAt(ann, ann.b.x, ann.b.y);
+      const dAlong = m1.alongM !== null && m2.alongM !== null ? Math.abs(m1.alongM - m2.alongM) : null;
+      const dDepth = m1.depthM !== null && m2.depthM !== null ? Math.abs(m1.depthM - m2.depthM) : null;
+      if (dAlong !== null || dDepth !== null) {
+        const parts = [];
+        if (dAlong !== null) parts.push(`${metres(dAlong).replace('≈ ', '')} along`);
+        if (dDepth !== null) parts.push(`${metres(dDepth).replace('≈ ', '')} deep`);
+        if (dAlong !== null && dDepth !== null) parts.push(`${Number(Math.hypot(dAlong, dDepth).toPrecision(3))} m apart`);
+        return parts.join(' · ');
       }
     }
-    return best || { x: clamp01(tx), y: clamp01(ty - 0.12) };
+    const dx = Math.abs(ann.b.x - ann.a.x) * 100;
+    const dy = Math.abs(ann.b.y - ann.a.y) * 100;
+    return `${dx.toFixed(1)}% × ${dy.toFixed(1)}% of image`;
+  }
+
+  /* ── Canvas layout ──────────────────────────────────── */
+
+  function layout() {
+    if (!state.image) return;
+    const cw = Math.max(240, Math.round(el.canvasWrap.clientWidth));
+    const ch = Math.max(220, Math.round(el.canvasWrap.clientHeight));
+    el.canvas.style.width = `${cw}px`;
+    el.canvas.style.height = `${ch}px`;
+
+    const iw = state.image.naturalW;
+    const ih = state.image.naturalH;
+    const fit = Math.min((cw * VIEW_FIT) / iw, (ch * VIEW_FIT) / ih);
+    const scale = fit * state.zoom;
+    const w = Math.max(12, iw * scale);
+    const h = Math.max(12, ih * scale);
+
+    view = { x: (cw - w) / 2, y: (ch - h) / 2, w, h, cw, ch, scale, fit };
+
+    el.frame.style.left = `${view.x}px`;
+    el.frame.style.top = `${view.y}px`;
+    el.frame.style.width = `${w}px`;
+    el.frame.style.height = `${h}px`;
+    el.zoomLevel.textContent = `${Math.round(scale * 100)}%`;
+    el.zoomOut.disabled = !state.image || state.zoom <= ZOOM_MIN;
+    el.zoomIn.disabled = !state.image || state.zoom >= ZOOM_MAX;
+  }
+
+  const cxOf = (nx) => view.x + nx * view.w;
+  const cyOf = (ny) => view.y + ny * view.h;
+  const nxOf = (px) => (px - view.x) / view.w;
+  const nyOf = (py) => (py - view.y) / view.h;
+
+  /* The canvas expressed in image-normalized units — the legal area for any
+     annotation. Negative x is the left margin, x > 1 the right margin. */
+  function canvasBounds() {
+    return { x0: nxOf(0), x1: nxOf(view.cw), y0: nyOf(0), y1: nyOf(view.ch) };
+  }
+
+  function clampToCanvas(p) {
+    const b = canvasBounds();
+    return { x: Math.min(b.x1, Math.max(b.x0, p.x)), y: Math.min(b.y1, Math.max(b.y0, p.y)) };
+  }
+
+  function setZoom(next, silent) {
+    const z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+    if (z === state.zoom) return;
+    state.zoom = z;
+    render();
+    if (!silent) T.debug('view.zoom', { zoom: +z.toFixed(2), scale: +view.scale.toFixed(3) });
   }
 
   /* ── Rendering ──────────────────────────────────────── */
 
-  function frameSize() {
-    return { w: el.image.clientWidth, h: el.image.clientHeight };
+  function render() {
+    layout();
+    renderLabels();
+    renderShapes();   // needs label boxes measured, so it runs second
+    renderList();
+    renderEditor();
   }
 
-  function render() {
-    renderLabels();
-    renderArrows();   // needs label boxes measured, so it runs second
-    renderList();
+  function labelNodeOf(id) {
+    return el.labels.querySelector(`[data-id="${CSS.escape(id)}"]`);
   }
 
   function renderLabels() {
-    const { w, h } = frameSize();
     el.labels.innerHTML = '';
 
     for (const ann of state.annotations) {
-      if (ann.kind === 'arrow') continue;
+      const kind = KIND[ann.kind];
+      if (!kind.label && !kind.readout) continue;
+
       const node = document.createElement('div');
-      node.className = 'ann-label';
+      node.className = `ann-label kind-${ann.kind}${ann.id === state.selectedId ? ' selected' : ''}`;
       node.dataset.id = ann.id;
-      node.style.left = `${ann.lx * w}px`;
-      node.style.top = `${ann.ly * h}px`;
       node.style.borderColor = ann.color;
       node.style.setProperty('--label-scale', ann.labelScale);
-      if (ann.id === state.selectedId) node.classList.add('selected');
+
+      if (kind.readout) {
+        // A measurement readout tracks the midpoint of its own line.
+        node.classList.add('readout');
+        const mid = ann.a && ann.b ? { x: (ann.a.x + ann.b.x) / 2, y: (ann.a.y + ann.b.y) / 2 } : { x: ann.lx, y: ann.ly };
+        node.style.left = `${cxOf(mid.x)}px`;
+        node.style.top = `${cyOf(mid.y)}px`;
+        if (ann.label && ann.label !== defaultLabel('ruler')) {
+          const title = document.createElement('span');
+          title.className = 'text';
+          title.textContent = ann.label;
+          node.appendChild(title);
+        }
+        const value = document.createElement('span');
+        value.className = 'label-measure';
+        value.textContent = rulerSummary(ann);
+        node.appendChild(value);
+        el.labels.appendChild(node);
+        continue;
+      }
+
+      node.style.left = `${cxOf(ann.lx)}px`;
+      node.style.top = `${cyOf(ann.ly)}px`;
 
       const text = document.createElement('span');
       text.className = 'text';
       text.textContent = ann.label;
       node.appendChild(text);
 
-      if(ann.calibration){const measure=document.createElement('span');measure.className='label-measure';measure.textContent=measurementSummary(ann);node.appendChild(measure);}
+      if (calOf(ann) && (ann.kind === 'target' || ann.kind === 'free')) {
+        const measure = document.createElement('span');
+        measure.className = 'label-measure';
+        measure.textContent = measurementSummary(ann);
+        node.appendChild(measure);
+      }
 
       if (ann.confidence != null) {
         const conf = document.createElement('span');
@@ -389,111 +585,152 @@
       resize.setAttribute('aria-label', `Resize ${ann.label}`);
       resize.innerHTML = '<svg aria-hidden="true"><use href="#i-resize"/></svg>';
       node.appendChild(resize);
+
       el.labels.appendChild(node);
-      if(w && h) {
-        resizeLabel(ann,ann.labelScale);
-        node.style.setProperty('--label-scale',ann.labelScale);
-        node.style.left=`${ann.lx*w}px`;
-        node.style.top=`${ann.ly*h}px`;
+      if (view.w && view.h) {
+        resizeLabel(ann, ann.labelScale);
+        node.style.setProperty('--label-scale', ann.labelScale);
+        node.style.left = `${cxOf(ann.lx)}px`;
+        node.style.top = `${cyOf(ann.ly)}px`;
       }
     }
   }
 
-  function renderArrows() {
-    const { w, h } = frameSize();
-    el.arrows.setAttribute('viewBox', `0 0 ${w} ${h}`);
-    el.arrows.setAttribute('width', w);
-    el.arrows.setAttribute('height', h);
+  const SVG = 'http://www.w3.org/2000/svg';
+  const mk = (name, attrs) => {
+    const node = document.createElementNS(SVG, name);
+    for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+    return node;
+  };
 
-    const svgNS = 'http://www.w3.org/2000/svg';
-    el.arrows.innerHTML = '';
+  function renderShapes() {
+    el.shapes.setAttribute('viewBox', `0 0 ${view.cw} ${view.ch}`);
+    el.shapes.setAttribute('width', view.cw);
+    el.shapes.setAttribute('height', view.ch);
+    el.shapes.innerHTML = '';
 
     for (const ann of state.annotations) {
-      if(ann.curve.length>1){
-        const trace=document.createElementNS(svgNS,'polyline');
-        trace.setAttribute('points',ann.curve.map(p=>`${p.x*w/1000},${p.y*h/1000}`).join(' '));
-        trace.setAttribute('class','hyperbola-trace');trace.setAttribute('stroke',ann.color);el.arrows.appendChild(trace);
-      }
-      const labelNode = el.labels.querySelector(`[data-id="${ann.id}"]`);
-      const box = {
-        cx: ann.lx * w,
-        cy: ann.ly * h,
-        hw: (labelNode ? labelNode.offsetWidth * ann.labelScale : 60) / 2 + 3,
-        hh: (labelNode ? labelNode.offsetHeight * ann.labelScale : 22) / 2 + 3,
-      };
-      const target = { x: ann.tx * w, y: ann.ty * h };
-
-      const start = ann.kind === 'arrow' ? {x: ann.lx*w, y: ann.ly*h} : edgeOfBox(box, target);
-      const dx = target.x - start.x;
-      const dy = target.y - start.y;
-      const len = Math.hypot(dx, dy);
-
-      const g = document.createElementNS(svgNS, 'g');
-      g.setAttribute('class', `ann ${ann.kind}${ann.id === state.selectedId ? ' selected' : ''}`);
+      const kind = KIND[ann.kind];
+      const g = mk('g', { class: `ann ${ann.kind}${ann.id === state.selectedId ? ' selected' : ''}` });
       g.dataset.id = ann.id;
 
-      if (len > 12) {
-        const ux = dx / len;
-        const uy = dy / len;
-        const head = 9;
-        const inset = ann.kind === 'arrow' ? 0 : 5;
-        const tip = { x: target.x - ux * inset, y: target.y - uy * inset };
-        const base = { x: tip.x - ux * head, y: tip.y - uy * head };
-
-        const line = document.createElementNS(svgNS, 'line');
-        line.setAttribute('class', 'arrow-line');
-        line.setAttribute('x1', start.x); line.setAttribute('y1', start.y);
-        line.setAttribute('x2', base.x);  line.setAttribute('y2', base.y);
-        line.setAttribute('stroke', ann.color);
-        g.appendChild(line);
-
-        const hit = document.createElementNS(svgNS, 'line');
-        hit.setAttribute('class', 'arrow-hit');
-        hit.setAttribute('x1', start.x); hit.setAttribute('y1', start.y);
-        hit.setAttribute('x2', tip.x);   hit.setAttribute('y2', tip.y);
-        g.appendChild(hit);
-
-        const wing = head * 0.52;
-        const poly = document.createElementNS(svgNS, 'polygon');
-        poly.setAttribute('points', [
-          `${tip.x},${tip.y}`,
-          `${base.x - uy * wing},${base.y + ux * wing}`,
-          `${base.x + uy * wing},${base.y - ux * wing}`,
-        ].join(' '));
-        poly.setAttribute('fill', ann.color);
-        g.appendChild(poly);
+      // AI hyperbola trace (0..1000 grid in image space)
+      if (ann.curve && ann.curve.length > 1) {
+        g.appendChild(mk('polyline', {
+          points: ann.curve.map((p) => `${cxOf(p.x / 1000)},${cyOf(p.y / 1000)}`).join(' '),
+          class: 'hyperbola-trace', stroke: ann.color, style: strokeStyle(2.5, ann),
+        }));
       }
 
-      const handle = document.createElementNS(svgNS, 'g');
-      handle.setAttribute('class', 'target-handle');
-      handle.dataset.id = ann.id;
-      handle.dataset.role = 'target';
-
-      const ring = document.createElementNS(svgNS, 'circle');
-      ring.setAttribute('class', 'target-ring');
-      ring.setAttribute('cx', target.x); ring.setAttribute('cy', target.y);
-      ring.setAttribute('r', 9);
-      ring.setAttribute('stroke', ann.color);
-      handle.appendChild(ring);
-
-      const dot = document.createElementNS(svgNS, 'circle');
-      dot.setAttribute('class', 'target-dot');
-      dot.setAttribute('cx', target.x); dot.setAttribute('cy', target.y);
-      dot.setAttribute('r', 3.5);
-      dot.setAttribute('fill', ann.color);
-      handle.appendChild(dot);
-
-      g.appendChild(handle);
-      if (ann.kind === 'arrow') {
-        const tail = handle.cloneNode(true);
-        tail.dataset.role = 'tail';
-        tail.querySelectorAll('circle').forEach(circle => {
-          circle.setAttribute('cx', start.x); circle.setAttribute('cy', start.y);
-        });
-        g.appendChild(tail);
+      if (ann.kind === 'free' && ann.path?.length > 1) {
+        const pts = ann.path.map((p) => `${cxOf(p.x)},${cyOf(p.y)}`).join(' ');
+        g.appendChild(mk('polyline', { points: pts, class: 'trace-line', stroke: ann.color, style: strokeStyle(2.6, ann) }));
+        g.appendChild(withRole(mk('polyline', { points: pts, class: 'shape-hit' }), ann, 'shape'));
+        const mid = pathMid(ann.path);
+        ann.tx = mid.x; ann.ty = mid.y;
       }
-      el.arrows.appendChild(g);
+
+      if (ann.kind === 'box' && ann.a && ann.b) {
+        const x = Math.min(cxOf(ann.a.x), cxOf(ann.b.x));
+        const y = Math.min(cyOf(ann.a.y), cyOf(ann.b.y));
+        const w = Math.abs(cxOf(ann.b.x) - cxOf(ann.a.x));
+        const h = Math.abs(cyOf(ann.b.y) - cyOf(ann.a.y));
+        g.appendChild(mk('rect', { x, y, width: w, height: h, class: 'region-box', stroke: ann.color, style: strokeStyle(2, ann) }));
+        g.appendChild(withRole(mk('rect', { x, y, width: w, height: h, class: 'shape-hit' }), ann, 'shape'));
+        g.appendChild(cornerHandle(ann, ann.a, 'pa'));
+        g.appendChild(cornerHandle(ann, ann.b, 'pb'));
+      }
+
+      if (ann.kind === 'ruler' && ann.a && ann.b) {
+        const p1 = { x: cxOf(ann.a.x), y: cyOf(ann.a.y) };
+        const p2 = { x: cxOf(ann.b.x), y: cyOf(ann.b.y) };
+        const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+        const nx = -(p2.y - p1.y) / len;
+        const ny = (p2.x - p1.x) / len;
+        g.appendChild(mk('line', { x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, class: 'ruler-line', stroke: ann.color, style: strokeStyle(2, ann) }));
+        for (const p of [p1, p2]) {
+          g.appendChild(mk('line', {
+            x1: p.x - nx * 7, y1: p.y - ny * 7, x2: p.x + nx * 7, y2: p.y + ny * 7,
+            class: 'ruler-tick', stroke: ann.color, style: strokeStyle(2.4, ann),
+          }));
+        }
+        g.appendChild(withRole(mk('line', { x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, class: 'shape-hit' }), ann, 'shape'));
+        g.appendChild(cornerHandle(ann, ann.a, 'pa'));
+        g.appendChild(cornerHandle(ann, ann.b, 'pb'));
+      }
+
+      if (ann.kind === 'arrow' && ann.a && ann.b) {
+        drawArrow(g, ann, { x: cxOf(ann.a.x), y: cyOf(ann.a.y) }, { x: cxOf(ann.b.x), y: cyOf(ann.b.y) }, 0);
+        g.appendChild(withRole(mk('line', {
+          x1: cxOf(ann.a.x), y1: cyOf(ann.a.y), x2: cxOf(ann.b.x), y2: cyOf(ann.b.y), class: 'shape-hit',
+        }), ann, 'shape'));
+        g.appendChild(cornerHandle(ann, ann.a, 'pa'));
+        g.appendChild(cornerHandle(ann, ann.b, 'pb'));
+      }
+
+      // Leader line from the label card to the target point
+      if (kind.leader) {
+        const node = labelNodeOf(ann.id);
+        const box = {
+          cx: cxOf(ann.lx),
+          cy: cyOf(ann.ly),
+          hw: (node ? node.offsetWidth * ann.labelScale : 60) / 2 + 3,
+          hh: (node ? node.offsetHeight * ann.labelScale : 22) / 2 + 3,
+        };
+        const target = { x: cxOf(ann.tx), y: cyOf(ann.ty) };
+        drawArrow(g, ann, edgeOfBox(box, target), target, 5);
+      }
+
+      if (kind.point) {
+        g.appendChild(cornerHandle(ann, { x: ann.tx, y: ann.ty }, ann.kind === 'free' ? 'shape' : 'target', true));
+      }
+
+      el.shapes.appendChild(g);
     }
+  }
+
+  function withRole(node, ann, role) {
+    node.dataset.id = ann.id;
+    node.dataset.role = role;
+    return node;
+  }
+
+  function cornerHandle(ann, point, role, ringed) {
+    const g = mk('g', { class: `target-handle${ringed ? ' ringed' : ''}` });
+    g.dataset.id = ann.id;
+    g.dataset.role = role;
+    const x = cxOf(point.x);
+    const y = cyOf(point.y);
+    g.appendChild(mk('circle', {
+      class: 'target-ring', cx: x, cy: y, r: ringed ? 9 : 7, stroke: ann.color, style: strokeStyle(1.5, ann),
+    }));
+    g.appendChild(mk('circle', { class: 'target-dot', cx: x, cy: y, r: 3.5, fill: ann.color }));
+    return g;
+  }
+
+  function drawArrow(g, ann, start, tip, inset) {
+    const dx = tip.x - start.x;
+    const dy = tip.y - start.y;
+    const len = Math.hypot(dx, dy);
+    if (len <= 12) return;
+
+    const ux = dx / len;
+    const uy = dy / len;
+    const head = 9 * (0.7 + 0.3 * weightOf(ann));
+    const end = { x: tip.x - ux * inset, y: tip.y - uy * inset };
+    const base = { x: end.x - ux * head, y: end.y - uy * head };
+
+    g.appendChild(mk('line', {
+      x1: start.x, y1: start.y, x2: base.x, y2: base.y, class: 'arrow-line', stroke: ann.color,
+      style: strokeStyle(2, ann),
+    }));
+    const wing = head * 0.52;
+    g.appendChild(mk('polygon', {
+      points: [`${end.x},${end.y}`,
+               `${base.x - uy * wing},${base.y + ux * wing}`,
+               `${base.x + uy * wing},${base.y - ux * wing}`].join(' '),
+      fill: ann.color,
+    }));
   }
 
   /* Where the line from the box centre toward `to` crosses the box edge. */
@@ -509,14 +746,14 @@
   }
 
   function renderList() {
-    el.annCount.textContent=state.annotations.length;
+    el.annCount.textContent = state.annotations.length;
     el.list.innerHTML = '';
 
     if (!state.annotations.length) {
       const p = document.createElement('p');
       p.className = 'empty';
       p.textContent = state.image
-        ? 'Scan ready. Select the scan icon above to find targets, or the + icon to add your own.'
+        ? 'Scan ready. Select the scan icon above to find targets, or draw your own with the canvas tools.'
         : 'Your targets will appear here. Upload a scan to get started.';
       el.list.appendChild(p);
       return;
@@ -539,17 +776,37 @@
 
       const meta = document.createElement('div');
       meta.className = 'meta';
-      const pos = `x ${(ann.tx * 100).toFixed(0)}%  y ${(ann.ty * 100).toFixed(0)}%`;
-      meta.textContent = ann.confidence != null
-        ? `${pos}  ·  ${Math.round(ann.confidence * 100)}%`
-        : pos;
+      const anchor = KIND[ann.kind].two && ann.a ? ann.a : { x: ann.tx, y: ann.ty };
+      const outside = anchor.x < 0 || anchor.x > 1 || anchor.y < 0 || anchor.y > 1;
+      const pos = `x ${(anchor.x * 100).toFixed(0)}%  y ${(anchor.y * 100).toFixed(0)}%`;
+      meta.textContent = [KIND[ann.kind].name, pos,
+        ann.confidence != null ? `${Math.round(ann.confidence * 100)}%` : null,
+        outside ? 'off-image' : null].filter(Boolean).join('  ·  ');
       body.appendChild(meta);
 
-      if(ann.calibration){
-        const m=metricsFor(ann),grid=document.createElement('div');grid.className='measurement-grid';
-        [['Along scan',metres(m.alongM)],['Depth',metres(m.depthM)]].forEach(([name,value])=>{const cell=document.createElement('div'),key=document.createElement('span'),val=document.createElement('strong');key.textContent=name;val.textContent=value;cell.append(key,val);grid.append(cell);});
+      if (ann.kind === 'ruler') {
+        const value = document.createElement('div');
+        value.className = 'measurement-basis';
+        value.textContent = rulerSummary(ann);
+        body.appendChild(value);
+      } else if (calOf(ann) && KIND[ann.kind].point) {
+        const m = metricsFor(ann);
+        const grid = document.createElement('div');
+        grid.className = 'measurement-grid';
+        [['Along scan', metres(m.alongM)], ['Depth', metres(m.depthM)]].forEach(([name, value]) => {
+          const cell = document.createElement('div');
+          const key = document.createElement('span');
+          const val = document.createElement('strong');
+          key.textContent = name;
+          val.textContent = value;
+          cell.append(key, val);
+          grid.append(cell);
+        });
         body.append(grid);
-        const basis=document.createElement('div');basis.className='measurement-basis';basis.textContent=`${m.basis}${m.timeNs!==null?' · '+Number(m.timeNs.toPrecision(3))+' ns':''}`;body.append(basis);
+        const basis = document.createElement('div');
+        basis.className = 'measurement-basis';
+        basis.textContent = `${m.basis}${m.timeNs !== null ? ` · ${Number(m.timeNs.toPrecision(3))} ns` : ''}`;
+        body.append(basis);
       }
 
       if (ann.note) {
@@ -563,16 +820,63 @@
       del.className = 'card-del';
       del.type = 'button';
       del.title = 'Delete annotation';
-      del.setAttribute('aria-label','Delete '+ann.label);
+      del.setAttribute('aria-label', `Delete ${ann.label}`);
       del.textContent = '×';
       del.addEventListener('click', (e) => {
         e.stopPropagation();
+        record();
         removeAnnotation(ann.id);
       });
 
       card.append(swatch, body, del);
       card.addEventListener('click', () => select(ann.id));
       el.list.appendChild(card);
+    }
+  }
+
+  /* ── Editor panel ───────────────────────────────────── */
+
+  function buildSwatches() {
+    el.editColors.innerHTML = '';
+    for (const color of PALETTE) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'swatch-btn';
+      b.dataset.color = color;
+      b.style.background = color;
+      b.title = color;
+      b.setAttribute('aria-label', `Use colour ${color}`);
+      b.addEventListener('click', () => {
+        const ann = byId(state.selectedId);
+        if (!ann || ann.color === color) return;
+        record();
+        ann.color = color;
+        render();
+      });
+      el.editColors.appendChild(b);
+    }
+  }
+
+  function renderEditor() {
+    const ann = byId(state.selectedId);
+    el.editor.hidden = !ann;
+    if (!ann) return;
+
+    el.editKind.textContent = KIND[ann.kind].name;
+    if (document.activeElement !== el.editLabel) el.editLabel.value = ann.label;
+    if (document.activeElement !== el.editNote) el.editNote.value = ann.note || '';
+
+    const hasConf = ann.confidence != null;
+    if (document.activeElement !== el.editConf) el.editConf.value = hasConf ? Math.round(ann.confidence * 100) : 0;
+    el.editConfOut.textContent = hasConf ? `${Math.round(ann.confidence * 100)}%` : 'not set';
+    el.confField.classList.toggle('unset', !hasConf);
+
+    if (document.activeElement !== el.editWeight) el.editWeight.value = weightOf(ann);
+    el.editWeightOut.textContent = `${weightOf(ann).toFixed(1)}×`;
+
+    for (const b of el.editColors.children) {
+      b.classList.toggle('on', b.dataset.color === ann.color);
+      b.setAttribute('aria-pressed', String(b.dataset.color === ann.color));
     }
   }
 
@@ -587,57 +891,197 @@
     render();
   }
 
-  /* ── Dragging ───────────────────────────────────────── */
+  /* ── Undo / redo ────────────────────────────────────── */
 
-  let drag = null;
+  const history = { past: [], future: [] };
+  const HISTORY_MAX = 80;
+
+  const serialize = () => JSON.stringify({ a: state.annotations, seq: state.seq });
+
+  function restore(snapshot) {
+    const parsed = JSON.parse(snapshot);
+    state.annotations = parsed.a;
+    state.seq = parsed.seq;
+    if (!state.annotations.some((a) => a.id === state.selectedId)) state.selectedId = null;
+  }
+
+  /* Call immediately BEFORE mutating, so undo returns to the prior state. */
+  function record() {
+    history.past.push(serialize());
+    if (history.past.length > HISTORY_MAX) history.past.shift();
+    history.future.length = 0;
+    updateHistoryButtons();
+  }
+
+  let lastNudge = 0;
+  function recordNudge() {
+    const now = performance.now();
+    if (now - lastNudge > 700) record();
+    lastNudge = now;
+  }
+
+  function undo() {
+    if (!history.past.length) return;
+    history.future.push(serialize());
+    restore(history.past.pop());
+    render();
+    updateHistoryButtons();
+  }
+
+  function redo() {
+    if (!history.future.length) return;
+    history.past.push(serialize());
+    restore(history.future.pop());
+    render();
+    updateHistoryButtons();
+  }
+
+  function updateHistoryButtons() {
+    el.btnUndo.disabled = !history.past.length;
+    el.btnRedo.disabled = !history.future.length;
+  }
+
+  /* ── Label placement ────────────────────────────────── */
+
+  /* Pick a label spot near the target that avoids other labels. The search now
+     reaches into the canvas margin, so labels can live off the image. */
+  function placeLabel(tx, ty, taken) {
+    const b = canvasBounds();
+    const pad = 0.03;
+    const radii = [0.16, 0.26, 0.38, 0.52];
+    const angles = [-90, -45, -135, 0, 180, 45, 135, 90];
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const r of radii) {
+      for (const deg of angles) {
+        const rad = (deg * Math.PI) / 180;
+        const x = tx + Math.cos(rad) * r * 0.75;
+        const y = ty + Math.sin(rad) * r;
+        if (x < b.x0 + pad || x > b.x1 - pad || y < b.y0 + pad || y > b.y1 - pad) continue;
+
+        let nearest = Infinity;
+        for (const p of taken) nearest = Math.min(nearest, Math.hypot(p.x - x, p.y - y));
+        const score = Math.min(nearest, 0.35) - r * 0.25;
+        if (score > bestScore) { bestScore = score; best = { x, y }; }
+      }
+    }
+    return best || clampToCanvas({ x: tx, y: ty - 0.12 });
+  }
+
+  /* Stack every label into the margins beside the scan, leaders fanning back in.
+     This is the layout a report figure usually wants. */
+  function arrangeLabels() {
+    const items = state.annotations.filter((a) => KIND[a.kind].leader);
+    if (!items.length) { toast('No labels with leader lines to arrange.'); return; }
+
+    const b = canvasBounds();
+    const leftRoom = -b.x0;
+    const rightRoom = b.x1 - 1;
+    if (Math.max(leftRoom, rightRoom) < 0.12) {
+      toast('Not enough margin — zoom out first so the labels have room beside the scan.', true);
+      return;
+    }
+
+    record();
+    const left = [];
+    const right = [];
+    for (const ann of items) {
+      const preferLeft = ann.tx < 0.5 ? leftRoom >= 0.12 : rightRoom < 0.12;
+      (preferLeft ? left : right).push(ann);
+    }
+
+    const place = (list, x) => {
+      list.sort((p, q) => p.ty - q.ty);
+      const top = b.y0 + 0.06;
+      const bottom = b.y1 - 0.06;
+      const step = list.length > 1 ? (bottom - top) / (list.length - 1) : 0;
+      list.forEach((ann, i) => {
+        ann.lx = x;
+        ann.ly = list.length > 1 ? top + step * i : (top + bottom) / 2;
+      });
+    };
+
+    place(left, b.x0 + leftRoom / 2);
+    place(right, 1 + rightRoom / 2);
+    render();
+    T.info('labels.arranged', { left: left.length, right: right.length });
+    toast(`Arranged ${items.length} label${items.length === 1 ? '' : 's'} into the margin.`);
+  }
+
+  /* ── Tools ──────────────────────────────────────────── */
 
   function setTool(tool) {
-    state.tool = tool;
-    el.btnArrow.setAttribute('aria-pressed', String(tool === 'arrow'));
-    el.frame.classList.toggle('drawing-arrow', tool === 'arrow');
-    el.canvasHint.textContent = tool === 'arrow'
-      ? 'Drag from arrow start to tip · Esc to cancel'
-      : 'Drag to move · Top-right handle to resize';
+    state.tool = tool || '';
+    for (const b of el.tools) {
+      const on = (b.dataset.tool || '') === state.tool;
+      b.setAttribute('aria-pressed', String(on));
+      b.classList.toggle('on', on);
+    }
+    el.canvas.classList.toggle('drawing', Boolean(state.tool));
+    el.canvasHint.textContent = TOOL_HINT[state.tool] || TOOL_HINT[''];
   }
 
   function resizeLabel(ann, scale, anchor) {
-    const node = el.labels.querySelector(`[data-id="${ann.id}"]`);
+    const node = labelNodeOf(ann.id);
     if (!node) return;
-    const {w, h} = frameSize();
-    const maxScale = Math.min(2.5, (w-4)/node.offsetWidth, (h-4)/node.offsetHeight);
-    ann.labelScale = Math.max(Math.min(.65, maxScale), Math.min(maxScale, scale));
-    const hw = node.offsetWidth * ann.labelScale / (2*w);
-    const hh = node.offsetHeight * ann.labelScale / (2*h);
-    ann.lx = Math.max(hw, Math.min(1-hw, anchor ? anchor.x+hw : ann.lx));
-    ann.ly = Math.max(hh, Math.min(1-hh, anchor ? anchor.y-hh : ann.ly));
+    const b = canvasBounds();
+    const maxScale = Math.min(3, (view.cw - 4) / Math.max(1, node.offsetWidth), (view.ch - 4) / Math.max(1, node.offsetHeight));
+    ann.labelScale = Math.max(Math.min(0.65, maxScale), Math.min(maxScale, scale));
+    const hw = (node.offsetWidth * ann.labelScale) / (2 * view.w);
+    const hh = (node.offsetHeight * ann.labelScale) / (2 * view.h);
+    ann.lx = Math.max(b.x0 + hw, Math.min(b.x1 - hw, anchor ? anchor.x + hw : ann.lx));
+    ann.ly = Math.max(b.y0 + hh, Math.min(b.y1 - hh, anchor ? anchor.y - hh : ann.ly));
   }
 
-  function pointInFrame(event) {
-    const rect = el.image.getBoundingClientRect();
-    return {
-      x: (event.clientX - rect.left) / rect.width,
-      y: (event.clientY - rect.top) / rect.height,
-    };
+  function pointInCanvas(event) {
+    const rect = el.canvas.getBoundingClientRect();
+    return { x: nxOf(event.clientX - rect.left), y: nyOf(event.clientY - rect.top) };
   }
 
-  el.frame.addEventListener('pointerdown', (event) => {
+  /* ── Dragging & drawing ─────────────────────────────── */
+
+  let drag = null;
+
+  el.canvas.addEventListener('pointerdown', (event) => {
     if (event.button !== 0 || state.busy || drag) return;
-    const p = pointInFrame(event);
-    if (state.tool === 'arrow') {
+    const p = clampToCanvas(pointInCanvas(event));
+
+    if (state.tool) {
       event.preventDefault();
-      const ann = addAnnotation({kind:'arrow', label:'Arrow', tx:p.x, ty:p.y, lx:p.x, ly:p.y});
+      record();
+      const tool = state.tool;
+
+      if (tool === 'note') {
+        const ann = addAnnotation({ kind: 'note', lx: p.x, ly: p.y });
+        state.selectedId = ann.id;
+        setTool('');
+        render();
+        el.editLabel.focus();
+        el.editLabel.select();
+        return;
+      }
+
+      const ann = tool === 'free'
+        ? addAnnotation({ kind: 'free', path: [p], tx: p.x, ty: p.y, lx: p.x, ly: p.y - 0.1 })
+        : addAnnotation({ kind: tool, a: { x: p.x, y: p.y }, b: { x: p.x, y: p.y }, tx: p.x, ty: p.y, lx: p.x, ly: p.y - 0.12 });
+
       state.selectedId = ann.id;
-      drag = {id:ann.id, mode:'draw', moved:false};
+      drag = { id: ann.id, mode: tool === 'free' ? 'draw-free' : 'draw', moved: false, created: true };
       render();
-      el.frame.setPointerCapture(event.pointerId);
+      capture(event);
       return;
     }
-    const handle = event.target.closest('.target-handle');
+
+    const roleNode = event.target.closest('[data-role]');
     const label = event.target.closest('.ann-label');
-    const arrow = event.target.closest('g.ann');
+    const group = event.target.closest('g.ann');
     const resize = event.target.closest('.label-resize');
-    const node = handle || label || arrow;
-    if (!node) return;
+    const node = roleNode || label || group;
+    if (!node) {
+      if (state.selectedId) select(null);
+      return;
+    }
     if (label && label.classList.contains('editing')) return;
 
     const ann = byId(node.dataset.id);
@@ -646,82 +1090,142 @@
     event.preventDefault();
     select(ann.id);
 
-    const mode = resize ? 'resize' : handle ? handle.dataset.role : label ? 'label' : ann.kind === 'arrow' ? 'move-arrow' : 'target';
-    const rect = label ? el.labels.querySelector(`[data-id="${ann.id}"]`).getBoundingClientRect() : null;
-    const {w,h} = frameSize();
+    let mode;
+    if (resize) mode = 'resize';
+    else if (roleNode) mode = roleNode.dataset.role;
+    else if (label) mode = KIND[ann.kind].readout ? 'shape' : 'label';
+    else mode = KIND[ann.kind].point ? 'target' : 'shape';
+
+    const rect = label && !KIND[ann.kind].readout ? labelNodeOf(ann.id).getBoundingClientRect() : null;
+    const anchorSource = mode === 'target' ? { x: ann.tx, y: ann.ty }
+      : mode === 'pa' ? ann.a
+        : mode === 'pb' ? ann.b
+          : { x: ann.lx, y: ann.ly };
+
+    record();
     drag = {
       id: ann.id,
       mode,
-      grabDx: (mode === 'target' ? ann.tx : ann.lx) - p.x,
-      grabDy: (mode === 'target' ? ann.ty : ann.ly) - p.y,
-      origin: {x:p.x, y:p.y, lx:ann.lx, ly:ann.ly, tx:ann.tx, ty:ann.ty},
+      grabDx: anchorSource.x - p.x,
+      grabDy: anchorSource.y - p.y,
+      origin: { x: p.x, y: p.y },
       startScale: ann.labelScale,
-      startWidth: rect?.width, startHeight: rect?.height,
-      anchor: rect ? {x:ann.lx-rect.width/(2*w), y:ann.ly+rect.height/(2*h)} : null,
+      startWidth: rect?.width,
+      startHeight: rect?.height,
+      anchor: rect ? { x: ann.lx - rect.width / (2 * view.w), y: ann.ly + rect.height / (2 * view.h) } : null,
       moved: false,
     };
-    el.frame.setPointerCapture(event.pointerId);
+    capture(event);
   });
 
-  el.frame.addEventListener('pointermove', (event) => {
+  /* Pointer capture keeps a drag alive outside the canvas, but it throws if the
+     pointer is already gone. A failed capture must not abort the drag. */
+  function capture(event) {
+    try { el.canvas.setPointerCapture(event.pointerId); } catch { /* drag still works */ }
+  }
+  function releaseCapture(event) {
+    try {
+      if (el.canvas.hasPointerCapture?.(event.pointerId)) el.canvas.releasePointerCapture(event.pointerId);
+    } catch { /* already released */ }
+  }
+
+  el.canvas.addEventListener('pointermove', (event) => {
     if (!drag) return;
     const ann = byId(drag.id);
     if (!ann) return;
 
-    const p = pointInFrame(event);
-    const nx = clamp01(p.x + drag.grabDx);
-    const ny = clamp01(p.y + drag.grabDy);
+    const raw = pointInCanvas(event);
+    const p = clampToCanvas(raw);
+    const moved = clampToCanvas({ x: raw.x + drag.grabDx, y: raw.y + drag.grabDy });
 
-    if (drag.mode === 'draw') { ann.tx=clamp01(p.x); ann.ty=clamp01(p.y); }
-    else if (drag.mode === 'resize') {
-      const {w,h}=frameSize();
-      const dx=(p.x-drag.origin.x)*w, dy=(p.y-drag.origin.y)*h;
-      const projection=(dx*drag.startWidth-dy*drag.startHeight)/(drag.startWidth**2+drag.startHeight**2);
-      resizeLabel(ann, drag.startScale*(1+projection), drag.anchor);
-    } else if (drag.mode === 'move-arrow') {
-      const o=drag.origin;
-      const dx=Math.max(-Math.min(o.lx,o.tx),Math.min(1-Math.max(o.lx,o.tx),p.x-o.x));
-      const dy=Math.max(-Math.min(o.ly,o.ty),Math.min(1-Math.max(o.ly,o.ty),p.y-o.y));
-      ann.lx=o.lx+dx; ann.ly=o.ly+dy; ann.tx=o.tx+dx; ann.ty=o.ty+dy;
-    } else if (drag.mode === 'target') { ann.tx = nx; ann.ty = ny; ann.curve = []; }
-    else { ann.lx = nx; ann.ly = ny; }
+    switch (drag.mode) {
+      case 'draw':
+        ann.b = { x: p.x, y: p.y };
+        ann.tx = p.x; ann.ty = p.y;
+        break;
+      case 'draw-free': {
+        const last = ann.path[ann.path.length - 1];
+        if (Math.hypot((p.x - last.x) * view.w, (p.y - last.y) * view.h) > 3) ann.path.push({ x: p.x, y: p.y });
+        break;
+      }
+      case 'resize': {
+        const dx = (raw.x - drag.origin.x) * view.w;
+        const dy = (raw.y - drag.origin.y) * view.h;
+        const projection = (dx * drag.startWidth - dy * drag.startHeight) /
+          (drag.startWidth ** 2 + drag.startHeight ** 2);
+        resizeLabel(ann, drag.startScale * (1 + projection), drag.anchor);
+        break;
+      }
+      case 'shape': {
+        // Move every point together, stopping when the shape reaches the canvas edge.
+        const b = canvasBounds();
+        const box = shapeBox(ann);
+        let dx = raw.x - drag.origin.x;
+        let dy = raw.y - drag.origin.y;
+        dx = Math.max(b.x0 - box.x0, Math.min(b.x1 - box.x1, dx));
+        dy = Math.max(b.y0 - box.y0, Math.min(b.y1 - box.y1, dy));
+        translate(ann, dx, dy);
+        drag.origin = { x: drag.origin.x + dx, y: drag.origin.y + dy };
+        break;
+      }
+      case 'pa': ann.a = { x: moved.x, y: moved.y }; break;
+      case 'pb': ann.b = { x: moved.x, y: moved.y }; break;
+      case 'target': ann.tx = moved.x; ann.ty = moved.y; ann.curve = []; break;
+      default: ann.lx = moved.x; ann.ly = moved.y;
+    }
 
     drag.moved = true;
+    layout();
     renderLabels();
-    renderArrows();
+    renderShapes();
   });
 
   function endDrag(event) {
     if (!drag) return;
-    const moved = drag.moved;
-    if (drag.mode === 'draw') {
-      const ann=byId(drag.id), {w,h}=frameSize();
-      if(event.type === 'pointercancel' || !ann || Math.hypot((ann.tx-ann.lx)*w,(ann.ty-ann.ly)*h)<12) {
-        removeAnnotation(drag.id);
-      } else {
-        setTool(null);
-      }
-    }
+    const { moved, created, mode, id } = drag;
+    const ann = byId(id);
     drag = null;
-    if (el.frame.hasPointerCapture?.(event.pointerId)) {
-      el.frame.releasePointerCapture(event.pointerId);
+
+    if (created) {
+      const tooSmall = mode === 'draw-free'
+        ? !ann || ann.path.length < 3
+        : !ann || Math.hypot((ann.b.x - ann.a.x) * view.w, (ann.b.y - ann.a.y) * view.h) < 12;
+
+      if (event.type === 'pointercancel' || tooSmall) {
+        if (ann) removeAnnotation(ann.id);
+        history.past.pop();          // the creation never happened
+        updateHistoryButtons();
+        setTool('');
+        releaseCapture(event);
+        render();
+        return;
+      }
+      if (ann.kind === 'free') { const m = pathMid(ann.path); ann.tx = m.x; ann.ty = m.y; }
+      setTool('');
+      T.debug('annotation.created', { kind: ann.kind, id: ann.id });
+    } else if (!moved) {
+      history.past.pop();            // a click that changed nothing
+      updateHistoryButtons();
     }
-    if (moved) render();
+
+    releaseCapture(event);
+    render();
   }
 
-  el.frame.addEventListener('pointerup', endDrag);
-  el.frame.addEventListener('pointercancel', endDrag);
+  el.canvas.addEventListener('pointerup', endDrag);
+  el.canvas.addEventListener('pointercancel', endDrag);
 
   /* ── Inline label editing ───────────────────────────── */
 
   el.labels.addEventListener('dblclick', (event) => {
-    if(event.target.closest('.label-resize'))return;
+    if (event.target.closest('.label-resize')) return;
     const node = event.target.closest('.ann-label');
-    if (!node) return;
+    if (!node || node.classList.contains('readout')) return;
     const ann = byId(node.dataset.id);
     if (!ann) return;
 
     const text = node.querySelector('.text');
+    const before = serialize();
     node.classList.add('editing');
     text.contentEditable = 'true';
     text.focus();
@@ -735,8 +1239,13 @@
     const commit = () => {
       text.contentEditable = 'false';
       node.classList.remove('editing');
-      const next = text.textContent.trim();
-      ann.label = next || 'Untitled feature';
+      const next = text.textContent.trim() || defaultLabel(ann.kind);
+      if (next !== ann.label) {
+        history.past.push(before);
+        history.future.length = 0;
+        updateHistoryButtons();
+        ann.label = next;
+      }
       render();
     };
 
@@ -747,38 +1256,133 @@
     });
   });
 
+  /* ── Editor field wiring ────────────────────────────── */
+
+  /* One editing session (a burst of typing, a slider drag) becomes one undo
+     step. The snapshot is taken on the first input rather than on focus, so it
+     is captured even when the field never received a focus event. */
+  function bindField(input, apply, live) {
+    let pending = null;
+    const begin = () => { if (pending === null) pending = serialize(); };
+
+    const flush = () => {
+      if (pending === null) return;
+      if (pending !== serialize()) {
+        history.past.push(pending);
+        if (history.past.length > HISTORY_MAX) history.past.shift();
+        history.future.length = 0;
+        updateHistoryButtons();
+      }
+      pending = null;
+    };
+
+    input.addEventListener('input', () => {
+      const ann = byId(state.selectedId);
+      if (!ann) return;
+      begin();
+      apply(ann, input.value);
+      live();
+    });
+    input.addEventListener('change', flush);
+    input.addEventListener('blur', flush);
+  }
+
+  bindField(el.editLabel, (ann, v) => { ann.label = v || defaultLabel(ann.kind); }, () => { renderLabels(); renderShapes(); renderList(); });
+  bindField(el.editNote, (ann, v) => { ann.note = v; }, () => renderList());
+  bindField(el.editConf, (ann, v) => { ann.confidence = Number(v) / 100; }, () => { renderLabels(); renderShapes(); renderList(); renderEditor(); });
+  bindField(el.editWeight, (ann, v) => { ann.weight = clampWeight(v); lastWeight = ann.weight; }, () => { renderShapes(); renderEditor(); });
+
+  el.btnWeightReset.addEventListener('click', () => {
+    const ann = byId(state.selectedId);
+    if (!ann || weightOf(ann) === 1) return;
+    record();
+    ann.weight = 1;
+    lastWeight = 1;
+    render();
+  });
+
+  el.btnConfClear.addEventListener('click', () => {
+    const ann = byId(state.selectedId);
+    if (!ann || ann.confidence == null) return;
+    record();
+    ann.confidence = null;
+    render();
+  });
+
+  el.btnDuplicate.addEventListener('click', duplicateSelected);
+  el.btnDeleteSel.addEventListener('click', () => {
+    if (!state.selectedId) return;
+    record();
+    removeAnnotation(state.selectedId);
+  });
+
+  function duplicateSelected() {
+    const ann = byId(state.selectedId);
+    if (!ann) return;
+    record();
+    const copy = JSON.parse(JSON.stringify(ann));
+    copy.id = `a${++state.seq}`;
+    state.annotations.push(copy);
+    translate(copy, 0.04, 0.04);
+    state.selectedId = copy.id;
+    render();
+    toast('Duplicated annotation.');
+  }
+
   /* ── Keyboard ───────────────────────────────────────── */
 
-  document.addEventListener('keydown', (event) => {
-    if(event.key==='Escape' && (state.tool || drag)) {
-      if(drag?.mode==='draw')removeAnnotation(drag.id);
-      drag=null;
-      setTool(null);
-      return;
-    }
-    const resizeControl=event.target.closest('.label-resize');
-    if(resizeControl && /^Arrow/.test(event.key)) {
-      const ann=byId(resizeControl.closest('.ann-label').dataset.id);
-      if(!ann)return;
-      event.preventDefault();
-      state.selectedId=ann.id;
-      resizeLabel(ann,ann.labelScale+(['ArrowUp','ArrowRight'].includes(event.key) ? .1 : -.1));
-      render();
-      el.labels.querySelector(`[data-id="${ann.id}"] .label-resize`)?.focus();
-      return;
-    }
-    if (!state.selectedId) return;
-    const editing = document.activeElement &&
-      (document.activeElement.isContentEditable ||
-       /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName));
-    if (editing) return;
+  const TOOL_KEYS = { v: '', a: 'arrow', b: 'box', r: 'ruler', p: 'free', n: 'note' };
 
+  document.addEventListener('keydown', (event) => {
+    const typing = document.activeElement &&
+      (document.activeElement.isContentEditable ||
+       /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName));
+
+    if (event.key === 'Escape' && (state.tool || drag)) {
+      if (drag?.created) { removeAnnotation(drag.id); history.past.pop(); updateHistoryButtons(); }
+      drag = null;
+      setTool('');
+      render();
+      return;
+    }
+
+    if ((event.ctrlKey || event.metaKey) && !typing) {
+      const k = event.key.toLowerCase();
+      if (k === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); return; }
+      if (k === 'y') { event.preventDefault(); redo(); return; }
+      if (k === 'd') { event.preventDefault(); duplicateSelected(); return; }
+    }
+
+    const resizeControl = event.target.closest?.('.label-resize');
+    if (resizeControl && /^Arrow/.test(event.key)) {
+      const ann = byId(resizeControl.closest('.ann-label').dataset.id);
+      if (!ann) return;
+      event.preventDefault();
+      recordNudge();
+      state.selectedId = ann.id;
+      resizeLabel(ann, ann.labelScale + (['ArrowUp', 'ArrowRight'].includes(event.key) ? 0.1 : -0.1));
+      render();
+      labelNodeOf(ann.id)?.querySelector('.label-resize')?.focus();
+      return;
+    }
+
+    if (typing) return;
+
+    if (state.image && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const tool = TOOL_KEYS[event.key.toLowerCase()];
+      if (tool !== undefined) { event.preventDefault(); setTool(state.tool === tool ? '' : tool); return; }
+      if (event.key === '+' || event.key === '=') { event.preventDefault(); setZoom(state.zoom * 1.25); return; }
+      if (event.key === '-' || event.key === '_') { event.preventDefault(); setZoom(state.zoom / 1.25); return; }
+      if (event.key === '0') { event.preventDefault(); setZoom(1); return; }
+    }
+
+    if (!state.selectedId) return;
     const ann = byId(state.selectedId);
     if (!ann) return;
 
-
     if (event.key === 'Delete' || event.key === 'Backspace') {
       event.preventDefault();
+      record();
       removeAnnotation(ann.id);
       return;
     }
@@ -788,9 +1392,20 @@
     if (!nudge) return;
 
     event.preventDefault();
-    ann.lx = clamp01(ann.lx + nudge[0]);
-    ann.ly = clamp01(ann.ly + nudge[1]);
-    if (event.altKey || ann.kind === 'arrow') { ann.tx = clamp01(ann.tx + nudge[0]); ann.ty = clamp01(ann.ty + nudge[1]); ann.curve = []; }
+    recordNudge();
+    const b = canvasBounds();
+
+    // Alt (or a shape with no separate label) moves the whole annotation.
+    if (event.altKey || !KIND[ann.kind].label) {
+      const box = shapeBox(ann);
+      const dx = Math.max(b.x0 - box.x0, Math.min(b.x1 - box.x1, nudge[0]));
+      const dy = Math.max(b.y0 - box.y0, Math.min(b.y1 - box.y1, nudge[1]));
+      translate(ann, dx, dy);
+      if (KIND[ann.kind].point) ann.curve = [];
+    } else {
+      ann.lx = Math.min(b.x1, Math.max(b.x0, ann.lx + nudge[0]));
+      ann.ly = Math.min(b.y1, Math.max(b.y0, ann.ly + nudge[1]));
+    }
     render();
   });
 
@@ -800,8 +1415,6 @@
      Google directly with the key from Settings. Both go through prompt.js so
      the request is identical either way. */
   async function analyze() {
-    /* Logged before any guard: if a click produces no network request, this
-       record says which precondition stopped it. */
     T.info('analyze.click', {
       hasImage: Boolean(state.image),
       busy: state.busy,
@@ -821,7 +1434,11 @@
     }
 
     const { apiKey, model } = settings();
-    if(el.velocity.value&&!PROMPT.validVelocity(el.velocity.value)){toast('Enter a wave velocity above 0 and at most 0.3 m/ns.',true);el.velocity.focus();return;}
+    if (el.velocity.value && !PROMPT.validVelocity(el.velocity.value)) {
+      toast('Enter a wave velocity above 0 and at most 0.3 m/ns.', true);
+      el.velocity.focus();
+      return;
+    }
     const useServer = state.server.hasServerKey;
 
     if (!useServer && !apiKey) {
@@ -837,11 +1454,8 @@
       uploadMb: +((state.image.uploadBase64.length * 0.75) / 1048576).toFixed(2),
       sourcePx: `${state.image.naturalW}×${state.image.naturalH}`,
     });
-    // Emits a warning every 3s while the spinner is up, so "stuck analyzing"
-    // shows exactly how long it has been stuck and on which path.
     const stopHeartbeat = T.heartbeat('analyze', { model, path: useServer ? 'proxy' : 'direct' });
 
-    /* Never let a stalled request spin forever: abort on timeout or on Cancel. */
     const controller = new AbortController();
     state.abort = controller;
     const timer = setTimeout(() => controller.abort('timeout'), REQUEST_TIMEOUT_MS);
@@ -855,7 +1469,7 @@
       const n = items.list.length;
       span.end({ annotations: n, modelUsed: items.modelUsed, serverMs: items.ms, reqId: items.reqId });
 
-      toast(n===0?'No clear target reflections found. Add a marker manually or try a clearer scan.':`Added ${n} annotation${n === 1 ? '' : 's'}${
+      toast(n === 0 ? 'No clear target reflections found. Add a marker manually or try a clearer scan.' : `Added ${n} annotation${n === 1 ? '' : 's'}${
         items.modelUsed && items.modelUsed !== model
           ? ` · ${model} was busy, answered by ${items.modelUsed}`
           : ''}.`);
@@ -901,8 +1515,6 @@
   async function callGeminiDirect(focus, apiKey, model, signal) {
     const url = `${PROMPT.ENDPOINT}/${encodeURIComponent(model)}:generateContent`;
 
-    // This path bypasses the server entirely, so it leaves no server-side trace.
-    // Log it prominently or a stall here looks like the app doing nothing.
     T.warn('gemini.direct_call', {
       model, reason: state.server.hasServerKey ? 'settings-key-override' : 'no-server-key',
       note: 'bypasses server proxy — no server-side logs for this request',
@@ -927,14 +1539,17 @@
       throw new Error(payload?.error?.message || `HTTP ${res.status}`);
     }
 
-    return { list: PROMPT.parseResponse(payload, {velocityMPerNs:el.velocity.value}), modelUsed: model };
+    return { list: PROMPT.parseResponse(payload, { velocityMPerNs: el.velocity.value }), modelUsed: model };
   }
 
+  /* Reanalysis keeps everything the operator drew by hand and replaces only the
+     model's own targets. */
   function applyResults(items) {
-    state.annotations = state.annotations.filter(ann => ann.kind === 'arrow');
+    record();
+    state.annotations = state.annotations.filter((ann) => ann.kind !== 'target' || ann.manual);
     state.selectedId = null;
 
-    const taken = [];
+    const taken = state.annotations.map((a) => ({ x: a.lx, y: a.ly }));
     for (const item of items) {
       const p = item.point || {};
       const tx = clamp01((Number(p.x) || 0) / 1000);
@@ -942,12 +1557,16 @@
       const spot = placeLabel(tx, ty, taken);
       taken.push(spot);
 
+      if (item.calibration) state.calibration = item.calibration;
+
       const conf = Number(item.confidence);
       addAnnotation({
         label: String(item.label || 'Feature').trim(),
         note: String(item.note || '').trim(),
         confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : null,
-        calibration:item.calibration||null,velocityMPerNs:item.velocityMPerNs,curve:item.curve||[],
+        calibration: item.calibration || null,
+        velocityMPerNs: item.velocityMPerNs,
+        curve: item.curve || [],
         tx, ty,
         lx: spot.x, ly: spot.y,
       });
@@ -959,23 +1578,19 @@
 
   function setBusy(on, message = '') {
     state.busy = on;
-    el.btnArrow.disabled=on || !state.image;
-    el.btnAdd.disabled=on || !state.image;
-    el.btnClear.disabled=on || !state.image;
-    if(on)setTool(null);
+    for (const b of [el.btnAdd, el.btnClear, el.btnArrange, ...el.tools]) b.disabled = on || !state.image;
+    if (on) setTool('');
     el.status.hidden = !on;
     el.btnAnalyze.disabled = on || !state.image;
     el.btnAnalyze.querySelector('span').textContent = on ? 'Analyzing…' : 'Analyze scan';
-    el.btnAnalyze.setAttribute('aria-label',on?'Analyzing…':'Analyze scan');
-    el.btnAnalyze.title=on?'Analyzing…':'Analyze scan';
-    el.btnAnalyze.classList.toggle('working',on);
-    el.stage.setAttribute('aria-busy',String(on));
+    el.btnAnalyze.setAttribute('aria-label', on ? 'Analyzing…' : 'Analyze scan');
+    el.btnAnalyze.title = on ? 'Analyzing…' : 'Analyze scan';
+    el.btnAnalyze.classList.toggle('working', on);
+    el.stage.setAttribute('aria-busy', String(on));
 
     clearTimeout(busyTimer);
     if (!on) return;
 
-    /* A silent spinner is indistinguishable from a hang. Congested models can
-       take 25s+ per attempt, so show elapsed time and say what is happening. */
     const started = Date.now();
     const tick = () => {
       const s = Math.round((Date.now() - started) / 1000);
@@ -991,28 +1606,141 @@
 
   /* ── Export ─────────────────────────────────────────── */
 
+  /* The exported PNG covers the image plus whatever spills into the margin, so
+     off-image labels are never cropped. Image pixels stay 1:1 with the source. */
+  function contentBounds() {
+    const b = { x0: 0, y0: 0, x1: 1, y1: 1 };
+    const grow = (x, y) => {
+      b.x0 = Math.min(b.x0, x); b.x1 = Math.max(b.x1, x);
+      b.y0 = Math.min(b.y0, y); b.y1 = Math.max(b.y1, y);
+    };
+
+    for (const ann of state.annotations) {
+      const box = shapeBox(ann);
+      grow(box.x0, box.y0);
+      grow(box.x1, box.y1);
+      if (KIND[ann.kind].label || KIND[ann.kind].readout) {
+        const node = labelNodeOf(ann.id);
+        const hw = ((node?.offsetWidth || 160) * ann.labelScale) / (2 * view.w);
+        const hh = ((node?.offsetHeight || 40) * ann.labelScale) / (2 * view.h);
+        const cx = KIND[ann.kind].readout && ann.a && ann.b ? (ann.a.x + ann.b.x) / 2 : ann.lx;
+        const cy = KIND[ann.kind].readout && ann.a && ann.b ? (ann.a.y + ann.b.y) / 2 : ann.ly;
+        grow(cx - hw, cy - hh);
+        grow(cx + hw, cy + hh);
+      }
+      for (const p of ann.curve || []) grow(p.x / 1000, p.y / 1000);
+    }
+
+    const padX = 0.02 + (b.x1 - b.x0) * 0.01;
+    const padY = 0.02 + (b.y1 - b.y0) * 0.01;
+    return { x0: b.x0 - padX, x1: b.x1 + padX, y0: b.y0 - padY, y1: b.y1 + padY };
+  }
+
   function exportPng() {
     if (!state.image) return;
 
-    const W = state.image.naturalW;
-    const H = state.image.naturalH;
-    const scale = W / Math.max(1, el.image.clientWidth);
+    const sw = state.image.naturalW;
+    const sh = state.image.naturalH;
+    const k = sw / Math.max(1, view.w);          // on-screen px → source px
+    const bounds = contentBounds();
+
+    const fullW = (bounds.x1 - bounds.x0) * sw;
+    const fullH = (bounds.y1 - bounds.y0) * sh;
+    const cap = Math.min(1, 9000 / fullW, 9000 / fullH);   // keep the PNG sane
 
     const canvas = document.createElement('canvas');
-    canvas.width = W;
-    canvas.height = H;
+    canvas.width = Math.max(1, Math.round(fullW * cap));
+    canvas.height = Math.max(1, Math.round(fullH * cap));
+
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(el.image, 0, 0, W, H);
+    ctx.scale(cap, cap);
+
+    const X = (nx) => (nx - bounds.x0) * sw;
+    const Y = (ny) => (ny - bounds.y0) * sh;
+
+    ctx.fillStyle = '#eef1ea';
+    ctx.fillRect(0, 0, fullW, fullH);
+    ctx.drawImage(el.image, X(0), Y(0), sw, sh);
+    ctx.strokeStyle = 'rgba(30,50,35,.25)';
+    ctx.lineWidth = Math.max(1, k);
+    ctx.strokeRect(X(0), Y(0), sw, sh);
 
     for (const ann of state.annotations) {
-      const fontPx = 11 * scale * ann.labelScale;
-      const pad = fontPx * .55;
+      const kind = KIND[ann.kind];
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      if (ann.curve?.length > 1) {
+        ctx.save();
+        ctx.strokeStyle = ann.color;
+        ctx.lineWidth = Math.max(2, 2 * k) * weightOf(ann);
+        ctx.setLineDash([5 * k, 4 * k]);
+        ctx.beginPath();
+        ann.curve.forEach((p, i) => (i ? ctx.lineTo(X(p.x / 1000), Y(p.y / 1000)) : ctx.moveTo(X(p.x / 1000), Y(p.y / 1000))));
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (ann.kind === 'free' && ann.path?.length > 1) {
+        ctx.strokeStyle = ann.color;
+        ctx.lineWidth = Math.max(2, 2.4 * k) * weightOf(ann);
+        ctx.beginPath();
+        ann.path.forEach((p, i) => (i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y))));
+        ctx.stroke();
+      }
+
+      if (ann.kind === 'box' && ann.a && ann.b) {
+        const x = Math.min(X(ann.a.x), X(ann.b.x));
+        const y = Math.min(Y(ann.a.y), Y(ann.b.y));
+        const w = Math.abs(X(ann.b.x) - X(ann.a.x));
+        const h = Math.abs(Y(ann.b.y) - Y(ann.a.y));
+        ctx.save();
+        ctx.strokeStyle = ann.color;
+        ctx.lineWidth = Math.max(2, 2 * k) * weightOf(ann);
+        ctx.setLineDash([9 * k, 5 * k]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.restore();
+      }
+
+      if (ann.kind === 'ruler' && ann.a && ann.b) {
+        const p1 = { x: X(ann.a.x), y: Y(ann.a.y) };
+        const p2 = { x: X(ann.b.x), y: Y(ann.b.y) };
+        const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+        const nx = -(p2.y - p1.y) / len;
+        const ny = (p2.x - p1.x) / len;
+        ctx.strokeStyle = ann.color;
+        ctx.lineWidth = Math.max(2, 2 * k) * weightOf(ann);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y);
+        for (const p of [p1, p2]) {
+          ctx.moveTo(p.x - nx * 7 * k, p.y - ny * 7 * k);
+          ctx.lineTo(p.x + nx * 7 * k, p.y + ny * 7 * k);
+        }
+        ctx.stroke();
+      }
+
+      if (ann.kind === 'arrow' && ann.a && ann.b) {
+        drawArrowOnCanvas(ctx, ann, { x: X(ann.a.x), y: Y(ann.a.y) }, { x: X(ann.b.x), y: Y(ann.b.y) }, 0, k);
+      }
+
+      if (!kind.label && !kind.readout) continue;
+
+      // ── label card ──
+      const fontPx = 11 * k * ann.labelScale;
+      const pad = fontPx * 0.55;
       const lineH = fontPx * 1.3;
-      const labelNode=el.labels.querySelector(`[data-id="${ann.id}"]`);
-      const maxW = Math.max(20, (labelNode?.offsetWidth || 215)*scale*ann.labelScale-pad*2);
+      const node = labelNodeOf(ann.id);
+      const maxW = Math.max(20, (node?.offsetWidth || 215) * k * ann.labelScale - pad * 2);
+
       ctx.font = `600 ${fontPx}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
-      const lines = wrapText(ctx, ann.label, maxW);
-      if(ann.calibration)lines.push(...wrapText(ctx,measurementSummary(ann),maxW));
+      const lines = [];
+      if (kind.readout) {
+        if (ann.label && ann.label !== defaultLabel('ruler')) lines.push(...wrapText(ctx, ann.label, maxW));
+        lines.push(...wrapText(ctx, rulerSummary(ann), maxW));
+      } else {
+        lines.push(...wrapText(ctx, ann.label, maxW));
+        if (calOf(ann) && kind.point) lines.push(...wrapText(ctx, measurementSummary(ann), maxW));
+      }
       const confText = ann.confidence != null ? `confidence ${Math.round(ann.confidence * 100)}%` : null;
 
       let boxW = 0;
@@ -1024,66 +1752,33 @@
       boxW += pad * 2;
       const boxH = lines.length * lineH + (confText ? Math.round(lineH * 0.85) : 0) + pad * 2 - (lineH - fontPx);
 
-      const cx = ann.lx * W;
-      const cy = ann.ly * H;
-      const box = { cx, cy, hw: boxW / 2 + 3, hh: boxH / 2 + 3 };
-      const target = { x: ann.tx * W, y: ann.ty * H };
+      const centre = kind.readout && ann.a && ann.b
+        ? { x: X((ann.a.x + ann.b.x) / 2), y: Y((ann.a.y + ann.b.y) / 2) }
+        : { x: X(ann.lx), y: Y(ann.ly) };
+      const box = { cx: centre.x, cy: centre.y, hw: boxW / 2 + 3, hh: boxH / 2 + 3 };
 
-      if(ann.curve.length>1){ctx.save();ctx.strokeStyle=ann.color;ctx.lineWidth=Math.max(2,2*scale);ctx.setLineDash([5*scale,4*scale]);ctx.beginPath();ann.curve.forEach((p,i)=>i?ctx.lineTo(p.x*W/1000,p.y*H/1000):ctx.moveTo(p.x*W/1000,p.y*H/1000));ctx.stroke();ctx.restore();}
-      // arrow
-      const start = ann.kind === 'arrow' ? {x:ann.lx*W,y:ann.ly*H} : edgeOfBox(box, target);
-      const dx = target.x - start.x;
-      const dy = target.y - start.y;
-      const len = Math.hypot(dx, dy);
-      const lw = Math.max(2, 2 * scale);
-
-      if (len > 12 * scale) {
-        const ux = dx / len;
-        const uy = dy / len;
-        const head = 9 * scale;
-        const inset=ann.kind==='arrow'?0:5*scale;
-        const tip = { x: target.x - ux * inset, y: target.y - uy * inset };
-        const base = { x: tip.x - ux * head, y: tip.y - uy * head };
-        const wing = head * 0.52;
+      if (kind.leader) {
+        const target = { x: X(ann.tx), y: Y(ann.ty) };
+        drawArrowOnCanvas(ctx, ann, edgeOfBox(box, target), target, 5 * k, k);
 
         ctx.strokeStyle = ann.color;
-        ctx.lineWidth = lw;
-        ctx.lineCap = 'round';
+        ctx.lineWidth = Math.max(1.5, 1.5 * k) * weightOf(ann);
         ctx.beginPath();
-        ctx.moveTo(start.x, start.y);
-        ctx.lineTo(base.x, base.y);
+        ctx.arc(target.x, target.y, 9 * k, 0, Math.PI * 2);
         ctx.stroke();
-
         ctx.fillStyle = ann.color;
         ctx.beginPath();
-        ctx.moveTo(tip.x, tip.y);
-        ctx.lineTo(base.x - uy * wing, base.y + ux * wing);
-        ctx.lineTo(base.x + uy * wing, base.y - ux * wing);
-        ctx.closePath();
+        ctx.arc(target.x, target.y, 3.5 * k, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      if(ann.kind==='arrow')continue;
-
-      // target marker
-      ctx.strokeStyle = ann.color;
-      ctx.lineWidth = Math.max(1.5, 1.5 * scale);
-      ctx.beginPath();
-      ctx.arc(target.x, target.y, 9 * scale, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = ann.color;
-      ctx.beginPath();
-      ctx.arc(target.x, target.y, 3.5 * scale, 0, Math.PI * 2);
-      ctx.fill();
-
-      // label box
-      const bx = cx - boxW / 2;
-      const by = cy - boxH / 2;
-      roundRect(ctx, bx, by, boxW, boxH, Math.round(6 * scale));
+      const bx = centre.x - boxW / 2;
+      const by = centre.y - boxH / 2;
+      roundRect(ctx, bx, by, boxW, boxH, Math.round(6 * k));
       ctx.fillStyle = '#f2f6fb';
       ctx.fill();
       ctx.strokeStyle = ann.color;
-      ctx.lineWidth = Math.max(1.5, 1.5 * scale);
+      ctx.lineWidth = Math.max(1.5, 1.5 * k);
       ctx.stroke();
 
       ctx.fillStyle = '#0b0f15';
@@ -1109,8 +1804,37 @@
       a.download = `gpr-annotated-${Date.now()}.png`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast('Exported annotated PNG.');
+      toast(`Exported ${canvas.width}×${canvas.height} PNG.`);
     }, 'image/png');
+  }
+
+  function drawArrowOnCanvas(ctx, ann, start, tip, inset, k) {
+    const dx = tip.x - start.x;
+    const dy = tip.y - start.y;
+    const len = Math.hypot(dx, dy);
+    if (len <= 12 * k) return;
+
+    const ux = dx / len;
+    const uy = dy / len;
+    const head = 9 * k * (0.7 + 0.3 * weightOf(ann));
+    const end = { x: tip.x - ux * inset, y: tip.y - uy * inset };
+    const base = { x: end.x - ux * head, y: end.y - uy * head };
+    const wing = head * 0.52;
+
+    ctx.strokeStyle = ann.color;
+    ctx.lineWidth = Math.max(2, 2 * k) * weightOf(ann);
+    ctx.beginPath();
+    ctx.moveTo(start.x, start.y);
+    ctx.lineTo(base.x, base.y);
+    ctx.stroke();
+
+    ctx.fillStyle = ann.color;
+    ctx.beginPath();
+    ctx.moveTo(end.x, end.y);
+    ctx.lineTo(base.x - uy * wing, base.y + ux * wing);
+    ctx.lineTo(base.x + uy * wing, base.y - ux * wing);
+    ctx.closePath();
+    ctx.fill();
   }
 
   function wrapText(ctx, text, maxWidth) {
@@ -1168,8 +1892,7 @@
     if (file) readFile(file);
   });
 
-  /* Populate the model datalist from the live ListModels call, so the names on
-     offer are the ones this key can really use. */
+  /* Populate the model datalist from the live ListModels call. */
   async function listModels() {
     el.modelNote.hidden = false;
     el.modelNote.classList.remove('bad');
@@ -1225,8 +1948,6 @@
     }
   });
 
-  /* analyze() is async, so a synchronous throw inside it becomes a rejected
-     promise that would otherwise vanish silently and leave the spinner up. */
   el.btnAnalyze.addEventListener('click', () => {
     analyze().catch((err) => {
       T.error('analyze.unhandled', { error: err?.message, stack: err?.stack?.split('\n').slice(0, 4).join(' | ') });
@@ -1235,22 +1956,41 @@
     });
   });
   el.btnExport.addEventListener('click', exportPng);
-  el.btnArrow.addEventListener('click',()=>{if(state.image&&!state.busy)setTool(state.tool==='arrow'?null:'arrow');});
+
+  for (const b of el.tools) {
+    b.addEventListener('click', () => {
+      if (!state.image || state.busy) return;
+      const tool = b.dataset.tool || '';
+      setTool(state.tool === tool ? '' : tool);
+    });
+  }
+
+  el.zoomIn.addEventListener('click', () => setZoom(state.zoom * 1.25));
+  el.zoomOut.addEventListener('click', () => setZoom(state.zoom / 1.25));
+  el.zoomFit.addEventListener('click', () => setZoom(1));
+  el.btnUndo.addEventListener('click', undo);
+  el.btnRedo.addEventListener('click', redo);
+  el.btnArrange.addEventListener('click', arrangeLabels);
 
   el.btnAdd.addEventListener('click', () => {
     if (!state.image) return;
+    record();
     const taken = state.annotations.map((a) => ({ x: a.lx, y: a.ly }));
     const tx = 0.5;
     const ty = 0.45 + (state.annotations.length % 4) * 0.08;
     const spot = placeLabel(tx, ty, taken);
     const ann = addAnnotation({ label: 'New annotation', tx, ty, lx: spot.x, ly: spot.y });
+    ann.manual = true;               // survives reanalysis
     state.selectedId = ann.id;
     render();
+    el.editLabel.focus();
+    el.editLabel.select();
   });
 
   el.btnClear.addEventListener('click', () => {
-    setTool(null);
+    setTool('');
     if (!state.annotations.length) return;
+    record();
     state.annotations = [];
     state.selectedId = null;
     state.seq = 0;
@@ -1258,10 +1998,17 @@
   });
 
   el.image.addEventListener('load', render);
-  document.querySelector('.canvas-toolbar label').addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();el.fileInput.click();}});
-  el.velocity.addEventListener('input',()=>{if(state.image)render();});
+  document.querySelector('.canvas-toolbar label').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); el.fileInput.click(); }
+  });
+  el.velocity.addEventListener('input', () => { if (state.image) render(); });
   window.addEventListener('resize', () => { if (state.image) render(); });
 
+  /* Read hook for tests/workspace.browser.js and for poking at a live session
+     from the console. Nothing in the app reads it back. */
+  window.__gprState = state;
+
+  buildSwatches();
   loadSettings();
   renderList();
   probeServer();

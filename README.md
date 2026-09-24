@@ -1,6 +1,6 @@
 # Data Helper
 
-Open `index.html` in a current desktop browser. No installation, server or internet connection is needed. Keep `index.html`, `styles.css`, `app.js`, `data.js`, `calculator.js`, `calculator-ui.js` and `vendor/` together when moving or hosting the app.
+Open `index.html` in a current desktop browser. No installation, server or internet connection is needed. Keep `index.html`, `styles.css`, `app.js`, `data.js`, `calculator.js`, `calculator-ui.js`, `fonts/` and `vendor/` together when moving or hosting the app.
 
 ## Temperature differences
 
@@ -10,6 +10,11 @@ the right column is reserved for output (**2 Results**). Each column scrolls
 internally if its own content is taller than the window. Below 1040 px wide the
 columns stack and the page becomes an ordinary scrolling document. Action icons
 have hover titles and accessible names: upload, copy, download, example and clear.
+
+Surfaces are separated by tone and spacing rather than borders: white cards on a
+tinted background, filled (not outlined) inputs, and tables without row rules.
+Cards ease in on load, buttons lift and their icons scale on hover, and the
+disclosure chevrons rotate. All of it is disabled under `prefers-reduced-motion`.
 
 The main flow is **1 Readings → 2 Results**. Paste cells or use the file picker in the same input column. **Copy for Excel** (top right of the results card) copies the entire result table; the download icon beside it saves it as .xlsx. Setup lives under the paste box: expand **Sensor pairs** to change the pair arrangement or signed/absolute mode, and **Detected columns** to correct a headerless paste. Missing date/time settings appear only when needed. After importing a file, source browsing and header controls appear below the results under **View source data & import settings**.
 
@@ -39,9 +44,11 @@ Keep `calculator.js` and `calculator-ui.js` with the other app files. Importing 
 - Formulas use cached results from the last Excel save; the app does not recalculate them. Save in Excel before importing if results are missing or outdated.
 - All file processing happens in browser memory. The app has no backend, analytics, external requests or persistent storage. Removing a file or reloading clears the workspace.
 
-## Dependency
+## Dependencies
 
 SheetJS Community Edition 0.20.3 is included locally in `vendor/`, under Apache 2.0. Source and browser integration instructions: https://docs.sheetjs.com/docs/getting-started/installation/standalone/
+
+The Outfit typeface (Open Font License) is self-hosted in `fonts/` as two variable `.woff2` subsets (latin, latin-ext) so the app makes no external requests and works offline. Tabular data — the paste box and the copy fallback — stays in Consolas so columns line up.
 
 ## Verification
 

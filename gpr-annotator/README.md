@@ -1,8 +1,11 @@
 # GPR Annotator
 
 Upload a ground penetrating radar image, Gemini interprets it, and the features come
-back as traced hyperbolas, apex markers and estimated positions/depths. Drag,
-resize, rename or add your own arrows, then export.
+back as traced hyperbolas, apex markers and estimated positions/depths. Then mark it
+up yourself: arrows, region boxes, measurements, freehand reflector traces and notes,
+on a canvas deliberately larger than the scan so annotations can live in the margin.
+Edit any annotation's text, confidence, colour and line weight, undo freely, and
+export at source resolution.
 
 Plain HTML/CSS/JS on the front end. The only backend is a zero-dependency Node script
 whose job is to hold the API key and forward requests.
@@ -95,37 +98,78 @@ The app decides between the two by probing `GET /api/config` at load.
 
 ## Using it
 
-- **Upload** — drop a radargram on the page or click to browse.
-- **Interpretation focus** — optional free text in the side panel (survey length,
+- **Upload** - drop a radargram on the page or click to browse.
+- **Interpretation focus** - optional free text in the side panel (survey length,
   depth range, "focus on utilities") appended to the prompt.
-- **Scan icon** — returns up to 10 target annotations, each with a caption,
+- **Scan icon** - returns up to 10 target annotations, each with a caption,
   rationale and confidence estimate. A scan with no clear targets can return none.
-- **Arrow icon** above the image — drag from the arrow's start to its tip. Escape
-  cancels drawing. Drag either endpoint or the shaft to adjust a completed arrow.
-- **Wave velocity** — optional survey-calibrated m/ns, used when converting a time
+- **Wave velocity** - optional survey-calibrated m/ns, used when converting a time
   axis to depth. A known time zero is also required.
 - Icon actions have hover titles and accessible names. The light card layout
   respects reduced-motion preferences.
 
+### The canvas is bigger than the scan
+
+GPR exports are often only a few hundred pixels wide, so the drawing surface is
+sized to the panel, **not** to the image. The scan is centred at about 70% of the
+canvas and scaled up to fill it; the band left over on all four sides is ordinary
+annotation space. Notes, labels and arrow tails may sit entirely off the image,
+which is what a report figure usually wants - callouts in the margin with leaders
+pointing back into the data.
+
+Coordinates are still a fraction of the image, so `x = -0.3` simply means "30% of
+the image width into the left margin". Everything survives window resizes and still
+exports at source resolution.
+
+- **Zoom** - the `-` / `+` buttons either side of the percentage, or `-`, `+` and
+  `0` on the keyboard. The percentage button refits the image. Zooming in shrinks
+  the margin; zoom out when you want more room for labels.
+- **Margin icon** (side panel) - stacks every leader-line label into the left and
+  right margins, ordered by depth. One click turns scattered markup into a figure
+  layout. It says so if there is not enough margin to do it.
+
+### Tools
+
+Pick a tool in the canvas toolbar, or press its key. A tool reverts to Select after
+one shape, and Esc cancels mid-draw.
+
+| Tool | Key | Draw | Produces |
+| --- | --- | --- | --- |
+| Select | `V` | - | Move, resize and re-target existing annotations |
+| Arrow | `A` | Drag tail to tip | A bare arrow; the tail may start in the margin |
+| Region | `B` | Drag a rectangle | A dashed box with its own draggable label |
+| Measurement | `R` | Drag between two points | A ruler reading along/depth separation from the axis calibration, or image percentages when no calibration is known |
+| Trace | `P` | Drag along the reflector | A freehand polyline with a label and leader |
+| Note | `N` | Click | A standalone text card with no leader - designed for the margin |
+
+Manual targets still come from the **+** icon in the panel. Everything drawn by hand
+survives reanalysis; only the model's own targets are replaced.
+
 ### Editing annotations
+
+Selecting anything - on the canvas or in the side panel - opens an editor under the
+list with that annotation's label, note, confidence, line weight and colour.
 
 | Action | How |
 | --- | --- |
-| Move a label | Drag the label box |
-| Resize a label | Drag its top-right handle; focus the handle and use arrow keys for keyboard adjustment |
-| Draw an arrow | Select the arrow icon above the scan, then drag on the image |
-| Move an arrow | Drag its shaft, or either endpoint |
-| Re-target an arrow | Drag the ringed dot at the arrow tip |
-| Edit the caption | Double-click the label; Enter commits, Esc cancels |
-| Select | Click a label, arrow, or side-panel card |
-| Nudge label | Arrow keys (Shift = bigger step) |
-| Nudge label + target together | Alt + arrow keys |
-| Delete | Delete/Backspace, or the × on the card |
-| Add manually | **+** icon in the panel |
+| Edit label / note | Editor fields, or double-click the label on the canvas |
+| Confidence | Editor slider; **Clear** removes the estimate entirely |
+| **Line weight** | Editor slider, 0.4x-4x. Scales arrows, boxes, rulers, traces, leaders and target rings together, on screen and in the export. New annotations inherit the last weight you set; **Reset** returns to 1x |
+| Colour | Editor swatches (8-colour palette) |
+| Move a label | Drag the label box anywhere in the canvas, margin included |
+| Resize a label | Drag its top-right handle; focus the handle and use arrow keys |
+| Move a target | Drag the ringed dot |
+| Move a whole shape | Drag its line, box edge or trace |
+| Reshape | Drag either endpoint handle of an arrow, ruler or box |
+| Nudge | Arrow keys (Shift = bigger step); Alt moves the whole annotation |
+| Duplicate | `Ctrl+D`, or the copy icon in the editor |
+| Delete | `Delete`/`Backspace`, the x on the card, or the editor's bin icon |
+| **Undo / redo** | `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`), or the toolbar arrows - 80 steps |
 
-**Export PNG** renders the image at its original resolution with arrows and labels
-burned in, including resized labels and manually drawn arrows. Reanalysis preserves
-manual arrows; clearing annotations removes everything.
+**Export PNG** renders at source resolution and **expands the frame to cover anything
+in the margin**, so off-image notes and labels are never cropped. The image itself
+stays 1:1 with the original pixels; the surrounding area is filled and the image edge
+outlined. Oversized results are capped at 9000px on the long edge.
 
 ## Measurements and interpretation
 
@@ -159,7 +203,8 @@ scales back up to full resolution.
 | --- | --- |
 | `index.html` | Markup, settings dialog |
 | `style.css` | Light card UI, motion preferences, label/arrow styling |
-| `app.js` | State, rendering, drag handling, PNG export, both request paths |
+| `app.js` | State, canvas layout, rendering, drag/draw handling, undo stack, PNG export, both request paths |
+| `tests/workspace.browser.js` | Drives every tool, the editor, undo/redo and export against a synthetic 420x260 scan |
 | `prompt.js` | System prompt, response schema, request builder/parser — shared by browser and server |
 | `server.js` | Static file server + `/api/annotate` proxy + `.env` loader |
 | `.env.example` | Optional per-app override template — the main one is at the DeltaTemp root |
@@ -190,6 +235,24 @@ source-resolution PNG export. `node tests/gpr-measurements.cjs` checks interpola
 unit conversion, time/depth conversion and missing calibration.
 `tests/gpr-editing.browser.js` uses a controlled response fixture; it does not
 validate AI interpretation accuracy.
+
+`tests/workspace.html` runs `tests/workspace.browser.js`. Open it in a browser, or
+headlessly with `--headless=new --window-size=1500,950 --virtual-time-budget=25000
+--allow-file-access-from-files --dump-dom`. The page title becomes
+`ALL n CHECKS PASSED` or `FAILED n/m`, and the full list lands in `#test-report`.
+It loads a synthetic 420x260 radargram and asserts that the canvas is larger than
+the image, that a small scan is scaled up, that all six tools produce annotations,
+that a note and an arrow tail land outside the image, that label / note /
+confidence / colour / line-weight edits apply, that undo, redo and duplicate
+behave, that margin arrangement moves every label off the image, that zoom and fit
+work, and that the exported PNG is wider than the source. All 22 checks passed on
+2026-09-24: canvas 985x463 around a 524x324 displayed image, export 743x321 from a
+420x260 source.
+
+`tests/workspace.html` is a copy of `index.html` with the test script appended and
+asset paths rewritten one level up, so regenerate it whenever `index.html` changes
+(a `sed` one-liner doing the six substitutions is in the git history of this file;
+the page fails loudly with a `CRASH` title if it has drifted).
 
 A live Gemini request on 2026-09-18 timed out at the server's 110-second limit.
 The revised prompt has not yet been validated against a completed live response.
