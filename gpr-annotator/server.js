@@ -14,6 +14,7 @@ const crypto = require('node:crypto');
 const { buildRequest, parseResponse, ENDPOINT, DEFAULT_MODEL } = require('./prompt.js');
 const { createLogger } = require('./logger.js');
 const { createMetrics } = require('./metrics.js');
+const { createAuth, AuthError, ACCESS_DOC } = require('./server-auth.js');
 
 const ROOT = __dirname;
 const PARENT = path.dirname(ROOT);
@@ -81,6 +82,12 @@ const FALLBACK_MODEL = (process.env.GEMINI_MODEL_FALLBACK ?? 'gemini-3.5-flash')
 const MAX_RETRIES = Math.max(1, Number(process.env.GEMINI_MAX_RETRIES) || 3);
 const PORT = Number(process.env.PORT) || 8787;
 
+/* Google sign-in (Firebase Auth). Every /api/* route except /api/config needs a
+   valid ID token, and every route except /api/me also needs the Firestore rules
+   to approve the user (see server-auth.js and ../firestore.rules). */
+const FIREBASE_PROJECT_ID = (process.env.FIREBASE_PROJECT_ID || '').trim() || 'gprportal-49b88';
+const authenticate = createAuth({ projectId: FIREBASE_PROJECT_ID });
+
 /* Requests currently being served. Surfaced by /api/health and the dashboard so
    a hung call is visible while it is still hanging, not only after it fails. */
 const inFlight = new Map();
@@ -90,7 +97,8 @@ const log = createLogger({
   // browser that never loaded the app from one that loaded a stale copy.
   level: (process.env.LOG_LEVEL || 'debug').toLowerCase(),
   dir: process.env.LOG_DIR || path.join(ROOT, 'logs'),
-  toFile: process.env.LOG_TO_FILE !== 'false',
+  // Vercel's filesystem is read-only; logs go to stdout (the Vercel log viewer).
+  toFile: process.env.LOG_TO_FILE !== 'false' && !process.env.VERCEL,
 });
 const metrics = createMetrics();
 
@@ -399,6 +407,14 @@ async function clientLog(req, res) {
    spend a real API key. */
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
+/* Browsers send Origin on same-origin POSTs too, so the deployed page calling
+   its own /api/* must not be mistaken for a cross-origin caller. */
+function isSameOrigin(req) {
+  const origin = req.headers.origin;
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  try { return Boolean(host) && new URL(origin).host === host; } catch { return false; }
+}
+
 function applyCors(req, res) {
   const origin = req.headers.origin;
   if (!origin || !LOCAL_ORIGIN.test(origin)) return;
@@ -406,11 +422,11 @@ function applyCors(req, res) {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Request-Id');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Request-Id, Authorization');
   res.setHeader('Access-Control-Max-Age', '600');
 }
 
-const server = http.createServer((req, res) => {
+function handler(req, res) {
   const { pathname } = new URL(req.url, 'http://localhost');
   const started = Date.now();
 
@@ -421,7 +437,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(204).end();
       return;
     }
-    if (req.headers.origin && !LOCAL_ORIGIN.test(req.headers.origin)) {
+    if (req.headers.origin && !LOCAL_ORIGIN.test(req.headers.origin) && !isSameOrigin(req)) {
       log.warn('http.origin_rejected', { path: pathname, origin: req.headers.origin });
       json(res, 403, { error: 'Cross-origin API access is limited to local development servers.' });
       return;
@@ -460,14 +476,67 @@ const server = http.createServer((req, res) => {
 
     log[level]('http.response', {
       reqId: res.reqId, method: req.method, path: pathname, status: res.statusCode, ms,
+      uid: res.user?.uid,
     });
   });
 
   if (pathname === '/api/config') {
-    json(res, 200, { hasServerKey: Boolean(API_KEY), model: MODEL, fallback: FALLBACK_MODEL || null, reqId: res.reqId });
+    json(res, 200, {
+      hasServerKey: Boolean(API_KEY), model: MODEL, fallback: FALLBACK_MODEL || null, reqId: res.reqId,
+      auth: { provider: 'google', projectId: FIREBASE_PROJECT_ID },
+    });
     return;
   }
 
+  if (pathname.startsWith('/api/')) {
+    authorize(req, res, pathname).then((user) => { if (user) routeApi(req, res, pathname); });
+    return;
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    json(res, 405, { error: 'Method not allowed.' });
+    return;
+  }
+
+  serveStatic(req, res);
+}
+
+/* Resolves to the user when the request may go on to a route. Otherwise it has
+   already answered (401, 403, 503, or /api/me) and resolves to null. */
+async function authorize(req, res, pathname) {
+  let user;
+  try {
+    user = await authenticate(req);
+  } catch (err) {
+    if (!(err instanceof AuthError)) {
+      log.error('auth.check_failed', { reqId: res.reqId, error: err.message });
+      json(res, 503, { error: 'Could not check your Google sign-in right now. Try again shortly.' });
+      return null;
+    }
+    log.warn('auth.rejected', { reqId: res.reqId, path: pathname, reason: err.message });
+    json(res, err.status, { error: err.message });
+    return null;
+  }
+
+  res.user = user;
+
+  if (pathname === '/api/me') {
+    json(res, 200, { uid: user.uid, email: user.email, name: user.name, allowed: user.allowed });
+    return null;
+  }
+
+  if (!user.allowed) {
+    log.warn('auth.not_allowed', { reqId: res.reqId, path: pathname, uid: user.uid, email: user.email });
+    json(res, 403, {
+      error: `${user.email || user.uid} is not approved for GPR Annotator. Ask an admin to add UID ${user.uid} to the Firestore rules.`,
+    });
+    return null;
+  }
+
+  return user;
+}
+
+function routeApi(req, res, pathname) {
   if (pathname === '/api/health') {
     const snap = metrics.snapshot();
     json(res, 200, {
@@ -518,52 +587,59 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    json(res, 405, { error: 'Method not allowed.' });
-    return;
-  }
+  json(res, 404, { error: 'Unknown API route.' });
+}
 
-  serveStatic(req, res);
-});
+/* On Vercel this file is imported by api/index.js and only `handler` is used;
+   the platform serves the static files and owns the process. */
+module.exports = { handler };
 
-server.listen(PORT, () => {
-  console.log(`\nDeltaTemp workspace  →  http://localhost:${PORT}`);
-  console.log(`  Data Helper:    http://localhost:${PORT}/`);
-  console.log(`  GPR Annotator:  http://localhost:${PORT}/gpr-annotator/`);
-  console.log(`  Observability:  http://localhost:${PORT}/gpr-annotator/observability.html\n`);
+if (require.main === module) startServer();
 
-  log.info('server.start', {
-    port: PORT,
-    model: MODEL,
-    fallback: FALLBACK_MODEL || null,
-    maxRetries: MAX_RETRIES,
-    hasKey: Boolean(API_KEY),
-    envFiles: envFilesLoaded.map((f) => path.relative(PARENT, f)),
-    logLevel: log.levelName,
-    logDir: log.dir,
-    node: process.version,
+function startServer() {
+  const server = http.createServer(handler);
+
+  server.listen(PORT, () => {
+    console.log(`\nDeltaTemp workspace  →  http://localhost:${PORT}`);
+    console.log(`  Data Helper:    http://localhost:${PORT}/`);
+    console.log(`  GPR Annotator:  http://localhost:${PORT}/gpr-annotator/`);
+    console.log(`  Observability:  http://localhost:${PORT}/gpr-annotator/observability.html\n`);
+
+    log.info('server.start', {
+      port: PORT,
+      model: MODEL,
+      fallback: FALLBACK_MODEL || null,
+      maxRetries: MAX_RETRIES,
+      hasKey: Boolean(API_KEY),
+      firebaseProject: FIREBASE_PROJECT_ID,
+      accessDoc: ACCESS_DOC,
+      envFiles: envFilesLoaded.map((f) => path.relative(PARENT, f)),
+      logLevel: log.levelName,
+      logDir: log.dir,
+      node: process.version,
+    });
+
+    if (!API_KEY) {
+      log.warn('server.no_key', {
+        hint: 'copy .env.example to .env.local and set GEMINI_API_KEY',
+        looked: ENV_CANDIDATES.map((f) => path.relative(PARENT, f)),
+      });
+    }
   });
 
-  if (!API_KEY) {
-    log.warn('server.no_key', {
-      hint: 'copy .env.example to .env.local and set GEMINI_API_KEY',
-      looked: ENV_CANDIDATES.map((f) => path.relative(PARENT, f)),
+  /* Never die silently — a crash must leave a record in the same log stream. */
+  process.on('uncaughtException', (err) => {
+    log.error('process.uncaught_exception', { error: err.message, stack: err.stack });
+    process.exitCode = 1;
+  });
+  process.on('unhandledRejection', (reason) => {
+    log.error('process.unhandled_rejection', { error: String(reason?.message || reason), stack: reason?.stack });
+  });
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+      log.info('server.stop', { signal, ...metrics.snapshot().counters });
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 2000).unref();
     });
   }
-});
-
-/* Never die silently — a crash must leave a record in the same log stream. */
-process.on('uncaughtException', (err) => {
-  log.error('process.uncaught_exception', { error: err.message, stack: err.stack });
-  process.exitCode = 1;
-});
-process.on('unhandledRejection', (reason) => {
-  log.error('process.unhandled_rejection', { error: String(reason?.message || reason), stack: reason?.stack });
-});
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => {
-    log.info('server.stop', { signal, ...metrics.snapshot().counters });
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
-  });
 }

@@ -1492,7 +1492,7 @@
   }
 
   async function callProxy(focus, signal) {
-    const res = await fetch(`${state.apiBase}/api/annotate`, {
+    const res = await window.GprAuth.fetch(`${state.apiBase}/api/annotate`, {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json' },
@@ -1900,7 +1900,7 @@
 
     try {
       if (!state.server.hasServerKey) throw new Error('no server key');
-      const res = await fetch(`${state.apiBase}/api/models`);
+      const res = await window.GprAuth.fetch(`${state.apiBase}/api/models`);
       const payload = await res.json();
       if (!res.ok) throw new Error(payload?.error || `HTTP ${res.status}`);
 

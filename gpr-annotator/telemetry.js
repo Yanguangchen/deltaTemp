@@ -58,11 +58,15 @@
     flushTimer = null;
     if (!pending.length) return;
 
+    // The API needs a signed-in user; hold the batch until there is one.
+    const token = await root.GprAuth?.token().catch(() => null);
+    if (!token && root.GprAuth && !root.GprAuth.bypassed) return;
+
     const batch = pending.splice(0, pending.length);
     try {
       await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify(batch),
         keepalive: true,
       });

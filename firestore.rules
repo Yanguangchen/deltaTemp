@@ -1,0 +1,35 @@
+rules_version = '2';
+
+// Firestore rules for gprportal-49b88, the Firebase project shared by the RAK
+// apps. These rules decide who is approved for every app on the project,
+// including GPR Annotator: its server reads appAccess/gpr-annotator using the
+// signed-in user's own token and lets them in only if this file allows the read.
+// To approve someone for all the apps, add their Auth UID to isAllowedUser().
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAllowedUser() {
+      return request.auth != null
+        && request.auth.uid in [
+          'CXEghvqTyEfiJJjY3zn6lNGjXg03',
+          's2MvSu9sbWREHYifLrSehKQ6QNB3',
+          'gV9UDP2O0efmp3YWZiWk5NOXfYm1'
+        ];
+    }
+
+    // Allow the users listed in allowedUsers.md to read and write all documents.
+    match /{document=**} {
+      allow read, write: if isAllowedUser();
+    }
+
+    // Per-app access check. An app reads appAccess/<app-id> as the signed-in user
+    // to ask "is this person approved?", and the document doesn't need to
+    // exist. Only the read is granted here, and it goes to the same users as
+    // above. Writes still come only from the rule above. Named explicitly so the
+    // check keeps working if the catch-all rule is ever narrowed.
+    match /appAccess/{appId} {
+      allow read: if isAllowedUser();
+    }
+  }
+}

@@ -95,6 +95,7 @@
   <div class="wrap" style="max-height:440px;overflow-y:auto"><table class="obs" id="logs"></table></div>
 </main>
 
+<script src="auth.js"></script>
 <script>
 (() => {
   'use strict';
@@ -120,13 +121,20 @@
       `<tbody>${rows.join('')}</tbody>`;
   }
 
+  async function getJson(url) {
+    const res = await window.GprAuth.fetch(url, { cache: 'no-store' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    return body;
+  }
+
   async function load() {
     let health, metrics, logs;
     try {
       [health, metrics, logs] = await Promise.all([
-        fetch('/api/health').then((r) => r.json()),
-        fetch('/api/metrics').then((r) => r.json()),
-        fetch(`/api/logs?limit=300&level=${$('level').value}`).then((r) => r.json()),
+        getJson('/api/health'),
+        getJson('/api/metrics'),
+        getJson(`/api/logs?limit=300&level=${$('level').value}`),
       ]);
       $('banner').hidden = true;
     } catch (err) {
@@ -209,9 +217,11 @@
     clearInterval(timer);
     if ($('auto').checked) timer = setInterval(tick, 2000);
   });
-  timer = setInterval(tick, 2000);
-
-  load();
+  // Every endpoint here needs an approved signed-in user.
+  window.GprAuth.ready.then(() => {
+    timer = setInterval(tick, 2000);
+    load();
+  });
 })();
 </script>
 </body>

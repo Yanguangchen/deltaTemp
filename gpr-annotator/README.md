@@ -67,6 +67,7 @@ it actually loaded.
 | `GEMINI_MODEL` | `gemini-3.7-flash` | Any model id your key can reach |
 | `GEMINI_MODEL_FALLBACK` | `gemini-3.5-flash` | Used on 429/503; empty disables |
 | `GEMINI_MAX_RETRIES` | `3` | Attempts per model before moving on |
+| `FIREBASE_PROJECT_ID` | `gprportal-49b88` | Project whose ID tokens are accepted |
 | `PORT` | `8787` | Local server port |
 
 Read nearest-first: `gpr-annotator\.env.local` → `gpr-annotator\.env` →
@@ -94,7 +95,150 @@ Settings dialog shows a green "server key active" banner and ignores its own key
 a key into Settings, where it's kept in `localStorage` and sent from the browser
 straight to Google. Fine for a quick local look; don't host the page this way.
 
-The app decides between the two by probing `GET /api/config` at load.
+The app decides between the two by probing `GET /api/config` at load. If that
+probe fails, the page shows "No API server reachable from …" and falls back to the
+Static path.
+
+## Google sign-in
+
+The page and the API both require a Google account, through Firebase Auth on the
+`gprportal-49b88` project. That project is shared with other RAK apps.
+
+**In the browser** (`auth.js`, loaded by `index.html` and `observability.html`), a
+sign-in screen covers the page until the user signs in with Google and the server
+confirms they are approved (`GET /api/me`). The round initial in the top bar shows
+who is signed in; click it to sign out. A signed-in user who isn't approved sees
+their UID so an admin can add it. Pages opened from `file://` skip the screen,
+because Firebase can't sign in there and there's no server to protect.
+
+**On the server** (`server-auth.js`), this is the part that actually protects the
+Gemini key. The sign-in screen only hides the UI. Every `/api/*` route except
+`/api/config` needs `Authorization: Bearer <Firebase ID token>`:
+
+| Route | No or bad token | Signed in, rules refuse | Signed in, rules approve |
+| --- | --- | --- | --- |
+| `/api/config` | 200 | 200 | 200 |
+| `/api/me` | 401 | 200, `allowed: false` | 200, `allowed: true` |
+| Everything else (`annotate`, `models`, `health`, `metrics`, `logs`, `client-log`) | 401 | 403 | Served |
+
+The token check has no dependencies. It verifies the RS256 signature against
+Google's published keys (cached for as long as Google's `Cache-Control` allows,
+and refetched at most once a minute when a new key appears), and checks `aud`
+and `iss` against the project and `exp`, `iat` and `auth_time` with 60s of clock
+skew. `node tests/gpr-auth.cjs` covers the accept and reject cases.
+
+### Who is approved: the Firestore rules
+
+Every RAK app on the project can sign people in, so a valid token only proves
+someone has an account there. Approval comes from the Firestore rules, and this
+app keeps no list of its own. After checking the token, the server reads
+`appAccess/gpr-annotator` from Firestore **using the user's own token**, so the
+rules judge that user:
+
+| Firestore answers | Meaning |
+| --- | --- |
+| 200 or 404 | The rules allowed the read (the document doesn't need to exist), so the user is approved |
+| 403 `PERMISSION_DENIED` | Not approved |
+| Anything else | Firestore outage. The API returns 503 rather than wrongly saying "not approved" |
+
+So everyone already approved by `isAllowedUser()` in `DeltaTemp/firestore.rules`
+can use GPR Annotator, and nobody else can. To approve someone for every RAK app
+at once, add their UID there and deploy the rules. Their UID is in Firebase
+console → Authentication → Users, or on the "not approved" screen they see after
+signing in.
+
+The server remembers each answer per UID: 5 minutes for "yes" and 30 seconds for
+"no". A newly approved user gets in within 30 seconds; a removed user can keep
+access for up to 5 minutes on a warm server instance.
+
+### Firestore rules
+
+`firestore.rules`, `firebase.json` and `.firebaserc` at the DeltaTemp root hold
+the rules for `gprportal-49b88`. Apart from comments, the only change from the
+rules this project had on 2026-09-24 is an explicit read rule for
+`appAccess/{appId}`, granted to the same `isAllowedUser()`. The catch-all rule
+already allows that read. The explicit rule keeps the check working if the
+catch-all is ever narrowed. No one gains or loses access.
+
+```bash
+firebase deploy --only firestore:rules --dry-run   # compile check, publishes nothing
+firebase deploy --only firestore:rules             # publish
+```
+
+These rules cover the **whole project**, including the other RAK apps. Deploying
+this file replaces whatever is live, so if another repo also deploys rules to
+`gprportal-49b88`, keep one copy as the source of truth.
+
+### One-time Firebase setup
+
+- **Authorized domains.** Firebase console → Authentication → Settings →
+  Authorized domains must include every host that serves the page:
+  `delta-temp.vercel.app`, plus any custom domain. `localhost` is there by default.
+  Otherwise sign-in fails with `auth/unauthorized-domain`, and the sign-in screen
+  says so.
+- **Google provider** must be enabled under Authentication → Sign-in method. It
+  probably already is, since the other RAK apps use it.
+- **API key restrictions (recommended).** The `apiKey` in `auth.js` is a public
+  identifier, not a secret. Restricting it by HTTP referrer in Google Cloud console
+  → Credentials still stops other sites from reusing it.
+
+The Firebase web config lives in `auth.js`. Analytics from the console snippet is
+not loaded, so the app still makes no tracking requests.
+
+## Deploying to Vercel
+
+Vercel serves the DeltaTemp folder as static files and never runs `server.js`. The
+API runs as a Vercel Function instead:
+
+- `api/index.js` (at the DeltaTemp root) exports the same `handler(req, res)` that
+  `server.js` uses locally, so both environments share one router.
+- `vercel.json` rewrites `/api/*` to that function, allows it 120s (the upstream
+  timeout is 110s) and bundles `prompt.js`, `logger.js` and `metrics.js` with it.
+- `server.js` only calls `listen()` when you run it directly (`npm start`).
+  Importing it does not start a server.
+
+Without this setup every `/api/*` request returns 404 in production, and the page
+shows the "No API server reachable" warning even on the deployed URL.
+
+### Setting the key
+
+`.env` / `.env.local` files are gitignored, so they never reach Vercel. Set the
+variables on the project instead:
+
+```bash
+vercel env add GEMINI_API_KEY production   # paste the key when prompted
+vercel env add GEMINI_API_KEY preview      # optional, for preview deployments
+```
+
+Approval needs no variable. It comes from the Firestore rules (see above).
+
+`GEMINI_MODEL`, `GEMINI_MODEL_FALLBACK` and `GEMINI_MAX_RETRIES` are optional and
+use the defaults above. Env changes only take effect after the next deployment.
+Check them with `curl https://<your-domain>/api/config`: `hasServerKey` should be
+`true`.
+
+### Differences from the local server
+
+| | Local (`npm start`) | Vercel |
+| --- | --- | --- |
+| Request body limit | 25 MB | **4.5 MB** (platform limit). Base64 makes the payload about a third larger than the file, so images over ~3.3 MB fail |
+| Log files | `logs/app-YYYY-MM-DD.jsonl` | None (read-only filesystem). Logs go to stdout and appear in the Vercel dashboard's logs view |
+| `/api/metrics`, `/api/logs`, `/api/health` | One process, full history | Per function instance and reset on cold start, so the observability dashboard shows only part of the traffic |
+| `.env` cascade | Loaded from disk | Not used. Set variables with `vercel env` |
+| Allowed origins | Same origin plus local dev servers (`localhost`, `127.0.0.1`) | Same. Other sites get 403, because these endpoints spend the server's key |
+
+`/api/logs`, `/api/metrics` and `/api/health` need an approved user, like every
+other route except `/api/config`.
+
+### Testing the Vercel path locally
+
+```bash
+vercel dev --listen 3311      # from the DeltaTemp root
+curl localhost:3311/api/config
+```
+
+`vercel dev` runs `api/index.js` the way production does, and it also reads
+`.env.local`.
 
 ## Using it
 
@@ -206,7 +350,12 @@ scales back up to full resolution.
 | `app.js` | State, canvas layout, rendering, drag/draw handling, undo stack, PNG export, both request paths |
 | `tests/workspace.browser.js` | Drives every tool, the editor, undo/redo and export against a synthetic 420x260 scan |
 | `prompt.js` | System prompt, response schema, request builder/parser — shared by browser and server |
-| `server.js` | Static file server + `/api/annotate` proxy + `.env` loader |
+| `auth.js` | Google sign-in screen, account button, and `GprAuth.fetch` (adds the ID token to API calls) |
+| `server-auth.js` | Firebase ID token verification, and the Firestore-rules access check; no dependencies |
+| `../firestore.rules` | Firestore rules for the shared `gprportal-49b88` project; they decide who is approved |
+| `server.js` | Static file server + `/api/annotate` proxy + `.env` loader; exports `handler` for Vercel |
+| `../api/index.js` | Vercel Function entry: re-exports `server.js`'s `handler` |
+| `../vercel.json` | Rewrites `/api/*` to the function, sets its duration and bundled files |
 | `.env.example` | Optional per-app override template — the main one is at the DeltaTemp root |
 
 `prompt.js` is a UMD-ish module loaded by both sides, so the served and static paths
@@ -253,6 +402,28 @@ work, and that the exported PNG is wider than the source. All 22 checks passed o
 asset paths rewritten one level up, so regenerate it whenever `index.html` changes
 (a `sed` one-liner doing the six substitutions is in the git history of this file;
 the page fails loudly with a `CRASH` title if it has drifted).
+
+On 2026-09-24 the Vercel path was checked with `vercel dev`: `/api/config` and
+`/api/health` answered from `api/index.js`, `/gpr-annotator/` served with a 200, and
+`npm start` still behaved as before. A POST carrying `Origin: https://delta-temp.vercel.app`
+with a matching `Host` was accepted, and one from a foreign origin got 403. This has not yet been checked on a real
+production deployment with `GEMINI_API_KEY` set.
+
+Google sign-in was checked on 2026-09-24. `node tests/gpr-auth.cjs` passes: it
+accepts a valid token and rejects malformed, wrong-key, unknown-kid, non-RS256,
+wrong-project, wrong-issuer, expired, future-dated, subject-less and edited
+tokens. It also checks the Firestore access mapping: 200 and 404 approve, 403
+refuses, 500 is reported as an error, the user's own token is sent, and the answer
+is cached. `firebase deploy --only firestore:rules --dry-run` compiled the rules
+against the live project, and an unauthenticated Firestore read returned 403 as
+expected. Against the running server, `/api/config`
+answered without a token and every other route returned 401. A token carrying a
+real Google key id with a forged signature was rejected. In Chrome the sign-in
+screen loaded the Firebase SDK and showed the Google button. At 390px wide the
+card sat 16px from each edge with no sideways scroll. `tests/workspace.html`
+(`file://`, sign-in skipped) still passed all 22 checks. A real Google sign-in
+through the popup, and the approved and not-approved screens after it, have not
+been tested yet.
 
 A live Gemini request on 2026-09-18 timed out at the server's 110-second limit.
 The revised prompt has not yet been validated against a completed live response.

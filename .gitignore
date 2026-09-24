@@ -8,3 +8,5 @@ node_modules/
 logs/
 *.jsonl
 __preview*
+.vercel
+.env*
