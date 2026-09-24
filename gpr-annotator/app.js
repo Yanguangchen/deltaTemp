@@ -29,6 +29,8 @@
     toast:      $('toast'),
     settings:   $('settings'),
     apiKey:     $('api-key'),
+    accessToken: $('access-token'),
+    tokenField:  $('access-token-field'),
     modelName:  $('model-name'),
     btnSettings: $('btn-settings'),
     btnAnalyze:  $('btn-analyze'),
@@ -174,10 +176,18 @@
 
     state.apiBase = found.base;
     state.server = found.cfg;
-    T.setEndpoint(`${found.base}/api/client-log`);
+    applyLogEndpoint();
     T.info('server.config', { ...found.cfg, apiBase: found.base || '(same origin)', clientVersion: T.version });
 
-    if (found.base) {
+    el.tokenField.hidden = !found.cfg.requiresToken;
+
+    if (found.cfg.requiresToken && !el.accessToken.value.trim()) {
+      T.warn('server.token_missing', { origin: location.origin });
+      showOriginWarning(
+        'This deployment is token-protected, so analyses will be rejected until you paste the access token into ' +
+        '<b>Settings → Access token</b>. It is the value of <code>GPR_ACCESS_TOKEN</code> on the server.',
+      );
+    } else if (found.base) {
       showOriginWarning(
         `This page is served from <code>${location.origin}</code>, so API calls are going cross-origin to ` +
         `<code>${found.base}</code>. That works, but <a href="${found.base}/gpr-annotator/">${found.base}/gpr-annotator/</a> ` +
@@ -198,12 +208,20 @@
     el.originWarning.hidden = false;
   }
 
+  /* The log shipper posts to a key-spending-adjacent route, so it carries the
+     token too. Re-applied after a settings save, since the token can be entered
+     long after the probe ran. */
+  function applyLogEndpoint() {
+    T.setEndpoint(`${state.apiBase}/api/client-log`, authHeaders());
+  }
+
   function reflectServerStatus() {
-    const { hasServerKey, model } = state.server;
+    const { hasServerKey, model, requiresToken } = state.server;
     el.serverStatus.hidden = !hasServerKey;
     if (hasServerKey) {
       el.serverStatus.textContent =
-        `Server key active (${model}). Requests are proxied through server.js — the field below is ignored.`;
+        `Server key active (${model}). Requests are proxied through the server — the key field below is ignored.` +
+        (requiresToken ? ' This deployment also requires the access token below.' : '');
     }
   }
 
@@ -213,14 +231,12 @@
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch { /* ignore */ }
     el.apiKey.value = saved.apiKey || '';
+    el.accessToken.value = saved.accessToken || '';
     el.modelName.value = saved.model || DEFAULT_MODEL;
   }
 
   function saveSettings() {
-    const data = {
-      apiKey: el.apiKey.value.trim(),
-      model: el.modelName.value.trim() || DEFAULT_MODEL,
-    };
+    const data = settings();
     try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch { /* ignore */ }
     return data;
   }
@@ -228,8 +244,16 @@
   function settings() {
     return {
       apiKey: el.apiKey.value.trim(),
+      accessToken: el.accessToken.value.trim(),
       model: el.modelName.value.trim() || DEFAULT_MODEL,
     };
+  }
+
+  /* Sent on every call to a route that spends the server's key. Absent when the
+     deployment has no token configured, which is the local case. */
+  function authHeaders() {
+    const token = el.accessToken.value.trim();
+    return state.server.requiresToken && token ? { 'x-gpr-token': token } : {};
   }
 
   /* ── Toast ──────────────────────────────────────────── */
@@ -1433,7 +1457,7 @@
       return;
     }
 
-    const { apiKey, model } = settings();
+    const { apiKey, accessToken, model } = settings();
     if (el.velocity.value && !PROMPT.validVelocity(el.velocity.value)) {
       toast('Enter a wave velocity above 0 and at most 0.3 m/ns.', true);
       el.velocity.focus();
@@ -1444,6 +1468,13 @@
     if (!useServer && !apiKey) {
       toast('No server key found. Add a Gemini API key in Settings, or run `npm start`.', true);
       el.settings.showModal();
+      return;
+    }
+
+    if (useServer && state.server.requiresToken && !accessToken) {
+      toast('This deployment needs an access token. Paste it into Settings.', true);
+      el.settings.showModal();
+      el.accessToken.focus();
       return;
     }
 
@@ -1495,7 +1526,7 @@
     const res = await fetch(`${state.apiBase}/api/annotate`, {
       method: 'POST',
       signal,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({
         mimeType: state.image.uploadMime,
         base64: state.image.uploadBase64,
@@ -1900,7 +1931,7 @@
 
     try {
       if (!state.server.hasServerKey) throw new Error('no server key');
-      const res = await fetch(`${state.apiBase}/api/models`);
+      const res = await fetch(`${state.apiBase}/api/models`, { headers: authHeaders() });
       const payload = await res.json();
       if (!res.ok) throw new Error(payload?.error || `HTTP ${res.status}`);
 
@@ -1942,6 +1973,8 @@
   el.settings.addEventListener('close', () => {
     if (el.settings.returnValue === 'save') {
       saveSettings();
+      applyLogEndpoint();   // a token entered just now has to reach the shipper
+      if (state.server.requiresToken && el.accessToken.value.trim()) el.originWarning.hidden = true;
       toast('Settings saved.');
     } else {
       loadSettings();

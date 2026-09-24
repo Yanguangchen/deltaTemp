@@ -96,6 +96,50 @@ straight to Google. Fine for a quick local look; don't host the page this way.
 
 The app decides between the two by probing `GET /api/config` at load.
 
+### Deployed on Vercel
+
+Vercel never runs `server.js` — it publishes the workspace as static files, so the
+`/api` routes it serves locally simply don't exist there. `../api/*.js` re-creates
+them as serverless functions: `config`, `health`, `models`, `annotate`, `client-log`.
+Same env vars (`GEMINI_API_KEY` and friends, set in Project → Settings → Environment
+Variables, then redeploy), same `prompt.js`, so a deployed analysis asks Gemini for
+exactly what a local one does.
+
+#### The access token
+
+A deployed `/api/annotate` is a Gemini proxy on a public URL. Set `GPR_ACCESS_TOKEN`
+in the Vercel environment and the routes that spend the key — `annotate`, `models`,
+`client-log` — require an `x-gpr-token` header matching it; without it they answer
+401. Paste the same value into Settings → "Access token", which appears only when
+the server says it needs one. `config` and `health` stay open so the client can
+discover that a token is required instead of assuming there's no server at all.
+
+Generate one with:
+
+```
+node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+```
+
+Leave it unset locally — `server.js` ignores the variable, and a local server is
+already reachable only from your own machine. Unset *in production* logs an
+`auth.open` warning to the Vercel runtime logs, because that combination means the
+URL alone is enough to spend your key.
+
+This is a shared secret, not authentication: it stops drive-by use, not someone the
+token was given to. Pair it with a budget cap on the Google project.
+
+Three further things are the platform's and differ from `npm start`:
+
+- Request bodies are capped at 4.5 MB. The client already downscales to a 1600 px
+  long edge before upload, so real radargrams land far under that.
+- Each invocation is its own process, so there are no uptime, in-flight or metric
+  counters and no log file. `/api/metrics` and `/api/logs` exist locally only, which
+  means `observability.html` is a local-server page. Function output goes to the
+  Vercel runtime logs instead, and `/api/health` reports `runtime: "vercel-function"`
+  so you can tell which server answered.
+- `vercel.json` gives `api/annotate.js` a 300 s limit, enough for the retry and
+  fallback chain. That ceiling needs Fluid compute; without it, lower it to 60.
+
 ## Using it
 
 - **Upload** - drop a radargram on the page or click to browse.

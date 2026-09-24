@@ -18,7 +18,7 @@
   /* Bump on every client change. Logged at session start so the server records
      which build the browser is actually running — the only reliable way to catch
      a stale cached page. */
-  const CLIENT_VERSION = '2026-09-18.4';
+  const CLIENT_VERSION = '2026-09-25.1';
 
   const buffer = [];
   const pending = [];
@@ -27,6 +27,7 @@
   let flushTimer = null;
   let shipping = true;
   let endpoint = '/api/client-log'; // re-pointed by the app once the API is found
+  let extraHeaders = {};            // e.g. the access token on a gated deployment
 
   function record(level, event, fields = {}) {
     const entry = { at: new Date().toISOString(), level, event, fields, sessionId };
@@ -60,12 +61,15 @@
 
     const batch = pending.splice(0, pending.length);
     try {
-      await fetch(endpoint, {
+      const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...extraHeaders },
         body: JSON.stringify(batch),
         keepalive: true,
       });
+      /* A gated deployment with no token yet rejects every batch. Retrying would
+         just burn invocations, so stop until setEndpoint is called again. */
+      if (res.status === 401 || res.status === 403) shipping = false;
     } catch {
       shipping = false; // no server (file:// or offline) — keep logging locally only
     }
@@ -116,9 +120,11 @@
     sessionId,
     span,
     /* Point the shipper at the API server once it is located — needed when the
-       page is served from a different port than server.js. */
-    setEndpoint(url) {
+       page is served from a different port than server.js. `headers` carries the
+       access token on a gated deployment; call again after it changes. */
+    setEndpoint(url, headers = {}) {
       endpoint = url;
+      extraHeaders = headers;
       shipping = true;
       if (pending.length) scheduleFlush();
     },
