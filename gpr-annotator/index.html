@@ -124,7 +124,7 @@
   </section>
 
   <!-- ── Side panel ─────────────────────────────────────── -->
-  <aside class="panel">
+  <aside id="panel" class="panel">
     <div class="panel-head">
       <h2>Annotations <span id="ann-count">0</span></h2>
       <div class="panel-head-actions">
@@ -140,6 +140,7 @@
 
     <div id="ann-editor" class="ann-editor" hidden>
       <div class="editor-head">
+        <button id="btn-editor-back" class="btn tiny icon-btn" type="button" title="Back to all annotations (Esc)" aria-label="Back to all annotations"><svg><use href="#i-back"/></svg></button>
         <h3>Edit</h3>
         <span id="edit-kind" class="kind-tag"></span>
         <button id="btn-duplicate" class="btn tiny icon-btn" type="button" title="Duplicate (Ctrl+D)" aria-label="Duplicate annotation"><svg><use href="#i-copy"/></svg></button>

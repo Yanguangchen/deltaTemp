@@ -681,3 +681,23 @@ textarea,input[type=text],input[type=password],input:not([type]),input[type=numb
 .auth-actions .btn{width:100%;padding:10px 14px;font-size:13px;font-weight:600}
 .auth-actions .btn[hidden]{display:none}
 .account-btn{font-size:14px;font-weight:650;color:var(--accent);border-radius:50%}
+
+/* ── Focus mode: editing one annotation ──────────────────
+   Selecting an annotation reduces the panel to its editor. The list, the bulk
+   actions and the scan-context card cannot act on a selection, so showing them
+   next to the fields that can is just competition for attention. The back button
+   in .editor-head (and Esc) is the way out. Must stay after the light-theme
+   block above, which re-declares .panel-head and .ann-list. */
+.panel.editing > .panel-head,
+.panel.editing > .ann-list,
+.panel.editing > .panel-foot { display: none; }
+
+/* The editor is the only child left, so let it take the height the list had
+   instead of floating at the top of an empty column. */
+.panel.editing > .ann-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.editor-head #btn-editor-back { margin-right: 2px; }

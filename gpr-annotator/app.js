@@ -67,6 +67,8 @@
     btnWeightReset: $('btn-weight-reset'),
     btnDuplicate: $('btn-duplicate'),
     btnDeleteSel: $('btn-delete-sel'),
+    panel: $('panel'),
+    btnEditorBack: $('btn-editor-back'),
   };
 
   /* Gemini is sent a downscaled copy — a phone photo is tens of megabytes as
@@ -860,6 +862,10 @@
   function renderEditor() {
     const ann = byId(state.selectedId);
     el.editor.hidden = !ann;
+    /* Focus mode: with one annotation selected the list, the bulk actions and the
+       scan-context card are all noise, so the panel collapses to just this editor.
+       Esc or the back button returns to the list. */
+    el.panel.classList.toggle('editing', !!ann);
     if (!ann) return;
 
     el.editKind.textContent = KIND[ann.kind].name;
@@ -1309,6 +1315,8 @@
     render();
   });
 
+  el.btnEditorBack.addEventListener('click', () => select(null));
+
   el.btnDuplicate.addEventListener('click', duplicateSelected);
   el.btnDeleteSel.addEventListener('click', () => {
     if (!state.selectedId) return;
@@ -1343,6 +1351,16 @@
       drag = null;
       setTool('');
       render();
+      return;
+    }
+
+    /* Esc with nothing being drawn leaves focus mode and brings the list back.
+       Checked before the `typing` guard below so it also works while the caret is
+       in one of the editor's own fields. */
+    if (event.key === 'Escape' && state.selectedId) {
+      event.preventDefault();
+      if (typing) document.activeElement.blur();
+      select(null);
       return;
     }
 
