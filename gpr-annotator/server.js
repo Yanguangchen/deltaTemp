@@ -281,6 +281,9 @@ async function annotate(req, res) {
   try {
     const chain = FALLBACK_MODEL && FALLBACK_MODEL !== model ? [model, FALLBACK_MODEL] : [model];
     let last = null;
+    // Per-model outcome, so the failure message can name which model got which
+    // status instead of blaming "all busy" for two different problems.
+    const outcomes = [];
 
     for (const name of chain) {
       for (let tryNo = 0; tryNo < MAX_RETRIES; tryNo++) {
@@ -321,6 +324,7 @@ async function annotate(req, res) {
         }
         if (!BUSY.has(result.status)) break; // 404/400/403 — retrying won't help
       }
+      outcomes.push({ name, status: last?.status ?? 0 });
     }
 
     const status = last?.status || 502;
@@ -333,14 +337,23 @@ async function annotate(req, res) {
       reqId, requested: model, modelUsed: last?.name || model, ok: false,
       ms: totalMs, imageMb: mb, status, error: detail,
     });
-    log.error('analyze.failure', { reqId, requested: model, tried: chain, status, totalMs, error: detail });
+    log.error('analyze.failure', {
+      reqId, requested: model, tried: chain, status, totalMs, error: detail,
+      outcomes: outcomes.map((o) => `${o.name}:${o.status}`).join(','),
+    });
 
+    /* 429 and 503 both mean "no answer", but they need opposite responses: a 429
+       is this key's quota and waiting does not clear it, while a 503 really is
+       contention. Say which, and show the per-model statuses either way. */
+    const tried = outcomes.map((o) => `${o.name} → HTTP ${o.status || 'no response'}`).join(', ');
     json(res, status, {
       error: status === 404
         ? `Model "${last.name}" does not exist for this key. Open Settings → "List models my key can call" to see valid names.`
-        : BUSY.has(status)
-          ? `${detail.replace(/\s+$/, '')} Tried ${chain.join(' then ')} — all busy. Wait a moment, or pick a different model in Settings.`
-          : detail,
+        : status === 429
+          ? `Quota exhausted for this API key, not a traffic spike — waiting will not clear it. Check the quota/billing for the key's Google project, or use a different key. Tried: ${tried}. Google said: ${detail.replace(/\s+$/, '')}`
+          : status === 503
+            ? `${detail.replace(/\s+$/, '')} Tried: ${tried}. If this persists for more than an hour it is not congestion — try a model from a different family in Settings, or a smaller image (this one was ${mb} MB).`
+            : `${detail} (HTTP ${status}; tried: ${tried})`,
     });
   } catch (err) {
     if (err.name === 'AbortError') {

@@ -85,6 +85,15 @@ server retries it 3 times (1s then 2s backoff) and then falls back to
 `GEMINI_MODEL_FALLBACK`, so a busy model degrades instead of failing. When the
 fallback answers, the toast says which model produced the annotations.
 
+When every model in the chain fails, the error names the status each one returned.
+A **503** is real contention — retry, drop to a smaller image, or pick a model from
+another family. A **429** is this key's quota and waiting does not clear it, so the
+message points at the Google project's quota and billing instead. A "busy" error
+that survives more than an hour is almost always a 429 or a key problem, not a
+traffic spike. Pick a fallback from a *different* family than `GEMINI_MODEL`;
+two flash models share the same project quota, so the fallback does not help
+when the cause is project-level.
+
 ## Two ways to run it
 
 **Served (recommended).** `npm start`. The key lives in `.env` on the server, the
